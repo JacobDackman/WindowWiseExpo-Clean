@@ -21,10 +21,17 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      }
+      },
+      "package": "com.jacobdackman.WindowWiseExpoClean"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "e3cb41e2-54b5-42de-adcb-c7ca22919dfd"
+      }
+    },
+    "owner": "jacobdackman"
   }
 }
