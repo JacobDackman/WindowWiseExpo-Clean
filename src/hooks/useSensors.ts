@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Platform } from 'react-native';
 import { Gyroscope, Magnetometer, Accelerometer, DeviceMotion } from 'expo-sensors';
 import * as Device from 'expo-device';
 import { SensorData, SensorsAvailability } from '../types';
+import { ENV } from '../config/env';
 
 // Default update interval in milliseconds
 const DEFAULT_UPDATE_INTERVAL = 100; // 10 times per second
@@ -34,29 +35,76 @@ export function useSensors(options?: {
   const stepDetectorRef = useRef<number>(0);
   const lastAccelerationRef = useRef<{ x: number; y: number; z: number } | null>(null);
 
+  // Refs for subscriptions
+  const subscriptionsRef = useRef({
+    accelerometer: null,
+    gyroscope: null,
+    magnetometer: null
+  });
+
+  // Refs for step detection
+  const lastStepTimeRef = useRef<number | null>(null);
+  const accelerationWindowRef = useRef<number[]>([]);
+
+  // Step detection configuration
+  const STEP_CONFIG = {
+    BASE_THRESHOLD: 0.3,
+    DEVICE_SPECIFIC_MULTIPLIER: Platform.select({
+      ios: 1.0,
+      android: 1.2, // Android sensors often need slightly different calibration
+      default: 1.0
+    }),
+    MIN_STEP_INTERVAL: 250, // Minimum time between steps in ms
+    ACCELERATION_WINDOW: 5, // Number of samples to average
+  };
+
+  // Cleanup function
+  const cleanupSubscriptions = useCallback(() => {
+    Object.values(subscriptionsRef.current).forEach(subscription => {
+      if (subscription) {
+        subscription.remove();
+      }
+    });
+    subscriptionsRef.current = {
+      accelerometer: null,
+      gyroscope: null,
+      magnetometer: null
+    };
+  }, []);
+
   // Check sensor availability
   useEffect(() => {
     const checkSensors = async () => {
       try {
+        // Initialize sensors one at a time with delays
         const accelerometerAvailable = await Accelerometer.isAvailableAsync();
+        await new Promise(resolve => setTimeout(resolve, 100)); // Small delay between checks
+        
         const gyroscopeAvailable = await Gyroscope.isAvailableAsync();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
         const magnetometerAvailable = await Magnetometer.isAvailableAsync();
+        await new Promise(resolve => setTimeout(resolve, 100));
         
         // Pedometer availability is platform-specific
-        // On iOS, check if device has motion hardware
-        // On Android, we'll use accelerometer for step detection
         let pedometerAvailable = false;
         
         if (Platform.OS === 'ios') {
           const deviceInfo = await Device.getDeviceTypeAsync();
-          // Only real devices (not simulators) have motion hardware
           pedometerAvailable = deviceInfo !== Device.DeviceType.UNKNOWN;
         } else {
-          // For Android, we'll use accelerometer for basic step detection
           pedometerAvailable = accelerometerAvailable;
         }
         
         setSensorsAvailable({
+          accelerometer: accelerometerAvailable,
+          gyroscope: gyroscopeAvailable,
+          magnetometer: magnetometerAvailable,
+          pedometer: pedometerAvailable,
+        });
+
+        // Log sensor availability for debugging
+        console.log('Sensor availability:', {
           accelerometer: accelerometerAvailable,
           gyroscope: gyroscopeAvailable,
           magnetometer: magnetometerAvailable,
@@ -89,115 +137,159 @@ export function useSensors(options?: {
     };
   }, [isTracking, enabled, updateInterval]);
 
-  // Detect steps using accelerometer data
-  const detectStep = (acceleration: { x: number; y: number; z: number }) => {
-    // Simple step detection algorithm
-    // We detect a step by looking for a significant vertical acceleration
-    // followed by a vertical deceleration
+  // Improved step detection with device-specific calibration and noise filtering
+  const detectStep = useCallback((acceleration: { x: number; y: number; z: number }) => {
+    const now = Date.now();
     
-    if (!lastAccelerationRef.current) {
-      lastAccelerationRef.current = acceleration;
+    // Check if enough time has passed since last step
+    if (lastStepTimeRef.current && (now - lastStepTimeRef.current) < STEP_CONFIG.MIN_STEP_INTERVAL) {
       return false;
     }
-    
-    // Calculate the magnitude of acceleration
+
+    // Calculate total acceleration magnitude
     const magnitude = Math.sqrt(
-      acceleration.x ** 2 + acceleration.y ** 2 + acceleration.z ** 2
+      acceleration.x * acceleration.x +
+      acceleration.y * acceleration.y +
+      acceleration.z * acceleration.z
     );
-    
-    // Calculate the difference from the last reading
-    const lastMagnitude = Math.sqrt(
-      lastAccelerationRef.current.x ** 2 + 
-      lastAccelerationRef.current.y ** 2 + 
-      lastAccelerationRef.current.z ** 2
-    );
-    
-    const diff = Math.abs(magnitude - lastMagnitude);
-    
-    // Threshold for step detection
-    // This would need calibration for different devices
-    const threshold = 0.3;
-    
-    lastAccelerationRef.current = acceleration;
-    
-    // If the difference is greater than the threshold, we detect a step
-    if (diff > threshold) {
-      // Debounce step detection to avoid multiple counts for a single step
-      const now = Date.now();
-      if (now - stepDetectorRef.current > 400) { // 400ms debounce
-        stepDetectorRef.current = now;
-        setStepCount(prevCount => prevCount + 1);
-        return true;
+
+    // Update acceleration window
+    accelerationWindowRef.current = [
+      ...(accelerationWindowRef.current || []).slice(-(STEP_CONFIG.ACCELERATION_WINDOW - 1)),
+      magnitude
+    ];
+
+    // Calculate average acceleration over window
+    const avgMagnitude = accelerationWindowRef.current.reduce((sum, val) => sum + val, 0) 
+      / accelerationWindowRef.current.length;
+
+    // Calculate adaptive threshold based on device
+    const adaptiveThreshold = STEP_CONFIG.BASE_THRESHOLD * STEP_CONFIG.DEVICE_SPECIFIC_MULTIPLIER;
+
+    // Check if this is a step
+    if (magnitude > avgMagnitude + adaptiveThreshold) {
+      if (ENV.ENABLE_DEBUG_LOGGING) {
+        console.log('Step detected:', {
+          magnitude,
+          avgMagnitude,
+          threshold: adaptiveThreshold,
+          timeSinceLastStep: lastStepTimeRef.current ? now - lastStepTimeRef.current : 'first step'
+        });
       }
+
+      lastStepTimeRef.current = now;
+      return true;
     }
-    
+
     return false;
-  };
+  }, []);
 
-  const startTracking = () => {
-    // Set update intervals
-    Accelerometer.setUpdateInterval(updateInterval);
-    Gyroscope.setUpdateInterval(updateInterval);
-    Magnetometer.setUpdateInterval(updateInterval);
-    
-    // Accelerometer subscription
-    const accelerometerSubscription = Accelerometer.addListener(accelerometerData => {
-      // Detect steps
-      const isStep = detectStep(accelerometerData);
+  // Start tracking
+  const startTracking = useCallback(async () => {
+    try {
+      // Clean up any existing subscriptions first
+      cleanupSubscriptions();
+
+      // Set update intervals
+      await Promise.all([
+        Accelerometer.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL),
+        Gyroscope.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL),
+        Magnetometer.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL)
+      ]);
+
+      // Create new subscriptions
+      subscriptionsRef.current.accelerometer = Accelerometer.addListener(data => {
+        // Detect steps
+        const isStep = detectStep(data);
+        
+        // Update sensor data
+        setSensorData(prev => ({
+          ...prev,
+          accelerometer: data,
+          // If we detected a step, update the pedometer data
+          pedometer: isStep ? { steps: stepCount + 1 } : prev.pedometer,
+          timestamp: Date.now(),
+        }));
+      });
+
+      subscriptionsRef.current.gyroscope = Gyroscope.addListener(data => {
+        setSensorData(prev => ({
+          ...prev,
+          gyroscope: data,
+          timestamp: Date.now(),
+        }));
+      });
+
+      subscriptionsRef.current.magnetometer = Magnetometer.addListener(data => {
+        setSensorData(prev => ({
+          ...prev,
+          magnetometer: data,
+          timestamp: Date.now(),
+        }));
+      });
+
+      if (ENV.ENABLE_DEBUG_LOGGING) {
+        console.log('Started sensor tracking with interval:', ENV.SENSOR_UPDATE_INTERVAL);
+      }
+
+      // Start tracking
+      setIsTracking(true);
       
-      // Update sensor data
-      setSensorData(prev => ({
-        ...prev,
-        accelerometer: accelerometerData,
-        // If we detected a step, update the pedometer data
-        pedometer: isStep ? { steps: stepCount + 1 } : prev.pedometer,
-        timestamp: Date.now(),
-      }));
-    });
-    
-    // Gyroscope subscription
-    const gyroscopeSubscription = Gyroscope.addListener(gyroscopeData => {
-      setSensorData(prev => ({
-        ...prev,
-        gyroscope: gyroscopeData,
-        timestamp: Date.now(),
-      }));
-    });
-    
-    // Magnetometer subscription
-    const magnetometerSubscription = Magnetometer.addListener(magnetometerData => {
-      setSensorData(prev => ({
-        ...prev,
-        magnetometer: magnetometerData,
-        timestamp: Date.now(),
-      }));
-    });
-    
-    // Return clean-up function
-    return () => {
-      accelerometerSubscription.remove();
-      gyroscopeSubscription.remove();
-      magnetometerSubscription.remove();
-    };
-  };
+      return true;
+    } catch (error) {
+      console.error('Error starting sensor tracking:', error);
+      cleanupSubscriptions();
+      setError('Failed to start sensors');
+      return false;
+    }
+  }, [cleanupSubscriptions, detectStep, stepCount, setSensorData, setIsTracking]);
 
-  const stopTracking = () => {
-    // Remove all sensor listeners
-    Accelerometer.removeAllListeners();
-    Gyroscope.removeAllListeners();
-    Magnetometer.removeAllListeners();
-  };
+  // Stop tracking
+  const stopTracking = useCallback(() => {
+    cleanupSubscriptions();
+    if (ENV.ENABLE_DEBUG_LOGGING) {
+      console.log('Stopped sensor tracking');
+    }
+    setIsTracking(false);
+  }, [cleanupSubscriptions, setIsTracking]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      cleanupSubscriptions();
+    };
+  }, [cleanupSubscriptions]);
 
   // Public methods
   const start = () => {
-    setIsTracking(true);
-    setStepCount(0);
-    lastAccelerationRef.current = null;
-    stepDetectorRef.current = 0;
+    try {
+      // Initialize sensor data with default values
+      setSensorData({
+        timestamp: Date.now(),
+        accelerometer: { x: 0, y: 0, z: 0 },
+        gyroscope: { x: 0, y: 0, z: 0 },
+        magnetometer: { x: 0, y: 0, z: 0 },
+        pedometer: { steps: 0 },
+      });
+      
+      setStepCount(0);
+      lastAccelerationRef.current = null;
+      stepDetectorRef.current = 0;
+      setError(null);
+      
+      // Start tracking
+      startTracking();
+      
+      return true;
+    } catch (error) {
+      console.error('Error starting sensors:', error);
+      setError('Failed to start sensors');
+      return false;
+    }
   };
 
   const stop = () => {
-    setIsTracking(false);
+    stopTracking();
   };
 
   const reset = () => {

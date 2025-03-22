@@ -30,7 +30,15 @@
     "extra": {
       "eas": {
         "projectId": "e3cb41e2-54b5-42de-adcb-c7ca22919dfd"
-      }
+      },
+      "APP_ENV": "development",
+      "APP_VERSION": "1.0.0",
+      "ENABLE_HIGH_ACCURACY_MODE": false,
+      "ENABLE_DEBUG_LOGGING": false,
+      "SENSOR_UPDATE_INTERVAL": 100,
+      "STEP_LENGTH": 0.75,
+      "AUTO_SAVE_INTERVAL": 60000,
+      "SHOW_MEASUREMENTS": true
     },
     "owner": "jacobdackman"
   }

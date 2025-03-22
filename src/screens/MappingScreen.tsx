@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   StyleSheet, 
   View, 
@@ -15,6 +15,14 @@ import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import * as MediaLibrary from 'expo-media-library';
+import { 
+  Magnetometer, 
+  Accelerometer, 
+  Gyroscope,
+  MagnetometerMeasurement,
+  AccelerometerMeasurement,
+  GyroscopeMeasurement
+} from 'expo-sensors';
 
 import { useApp } from '../contexts/AppContext';
 import { useSensors } from '../hooks/useSensors';
@@ -26,13 +34,43 @@ import { FloorManager } from '../components/FloorManager';
 import { WallEditor } from '../components/WallEditor';
 import { MapExporter } from '../components/MapExporter';
 import { FeatureType, Point } from '../types';
+import { ENV } from '../config/env';
+
+// Define sensor subscription types
+type SensorInitStatus = {
+  accelerometer: boolean;
+  magnetometer: boolean;
+  pedometer: boolean;
+};
+
+type ThreeAxisMeasurement = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+type SensorSubscription = {
+  remove: () => void;
+};
+
+// Define sensor measurement types
+type SensorMeasurement = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+type SensorSubscriptionType = {
+  remove: () => void;
+  [key: string]: any;
+};
 
 export const MappingScreen: React.FC = () => {
   const navigation = useNavigation();
   const { state, dispatch, startMapping, pauseMapping, stopMapping, addFeature, saveProject } = useApp();
   const { currentProject, mappingState, settings } = state;
   const { isTracking, sensorData, sensorsAvailable, error: sensorError } = useSensors();
-  
+  const [calibrationCountdown, setCalibrationCountdown] = useState(3);
   const [mappingProcessor] = useState(() => new MappingProcessor(settings));
   const [isFloorManagerVisible, setFloorManagerVisible] = useState(false);
   const [isWallEditorVisible, setWallEditorVisible] = useState(false);
@@ -46,8 +84,17 @@ export const MappingScreen: React.FC = () => {
     isMoving: false,
   });
   
+  // Sensor initialization state
+  const [isSensorInitializing, setIsSensorInitializing] = useState(false);
+  const [sensorInitStatus, setSensorInitStatus] = useState<SensorInitStatus>({
+    accelerometer: false,
+    magnetometer: false,
+    pedometer: false,
+  });
+  
   const pointsRef = useRef<Point[]>([]);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const sensorCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
   
   // Get current floor info
   const currentFloor = currentProject?.floors.find(
@@ -55,6 +102,80 @@ export const MappingScreen: React.FC = () => {
   );
   const currentFloorName = currentFloor?.name || 'No Floor';
   const wallCount = currentFloor?.walls.length || 0;
+  // Add these new state variables after your existing ones:
+  const [isAdvancedCalibrating, setIsAdvancedCalibrating] = useState(false);
+  const [calibrationSkipped, setCalibrationSkipped] = useState(false);
+  
+  // Update subscription refs with proper types
+  const magnetometerSubscriptionRef = useRef<{ remove: () => void } | null>(null);
+  const accelerometerSubscriptionRef = useRef<{ remove: () => void } | null>(null);
+  const gyroscopeSubscriptionRef = useRef<{ remove: () => void } | null>(null);
+
+  // Initialize sensors and check if they're working
+  const initializeSensors = async () => {
+    return new Promise<boolean>(async (resolve, reject) => {
+      try {
+        // Initialize all sensors in parallel
+        const [accelerometerAvailable, magnetometerAvailable] = await Promise.all([
+          Accelerometer.isAvailableAsync(),
+          Magnetometer.isAvailableAsync(),
+        ]);
+
+        // Set up sensor subscriptions with proper types
+        if (accelerometerAvailable) {
+          try {
+            await Accelerometer.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL);
+            accelerometerSubscriptionRef.current = Accelerometer.addListener(
+              (accelerometerData: ThreeAxisMeasurement) => {
+                setSensorInitStatus(prev => ({ ...prev, accelerometer: true }));
+              }
+            );
+          } catch (error) {
+            console.error('Error setting up accelerometer:', error);
+          }
+        }
+
+        if (magnetometerAvailable) {
+          try {
+            await Magnetometer.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL);
+            magnetometerSubscriptionRef.current = Magnetometer.addListener(
+              (magnetometerData: ThreeAxisMeasurement) => {
+                setSensorInitStatus(prev => ({ ...prev, magnetometer: true }));
+              }
+            );
+          } catch (error) {
+            console.error('Error setting up magnetometer:', error);
+          }
+        }
+
+        // Update sensor status atomically
+        setSensorInitStatus({
+          accelerometer: accelerometerAvailable,
+          magnetometer: magnetometerAvailable,
+          pedometer: accelerometerAvailable, // Use accelerometer for step detection
+        });
+
+        // Check if all sensors are available
+        if (accelerometerAvailable && magnetometerAvailable) {
+          resolve(true);
+        } else {
+          const unavailableSensors: string[] = [];
+          if (!accelerometerAvailable) unavailableSensors.push('Accelerometer');
+          if (!magnetometerAvailable) unavailableSensors.push('Magnetometer');
+          
+          Alert.alert(
+            'Sensor Unavailable',
+            `The following sensors are not available: ${unavailableSensors.join(', ')}. The app may not function correctly.`
+          );
+          resolve(false);
+        }
+      } catch (error) {
+        console.error('Error initializing sensors:', error);
+        Alert.alert('Error', 'Failed to initialize sensors. Please restart the app.');
+        reject(error);
+      }
+    });
+  };
   
   // Lock screen to portrait mode
   useEffect(() => {
@@ -74,11 +195,33 @@ export const MappingScreen: React.FC = () => {
 
   // Process sensor data when tracking
   useEffect(() => {
+    // Check sensor initialization status when initializing
+    if (isSensorInitializing && sensorData) {
+      const newStatus = {...sensorInitStatus};
+      
+      // Check if we've received valid accelerometer data
+      if (sensorData.accelerometer) {
+        newStatus.accelerometer = true;
+      }
+      
+      // Check if we've received valid magnetometer data
+      if (sensorData.magnetometer) {
+        newStatus.magnetometer = true;
+      }
+      
+      // For pedometer, we'll consider it initialized if accelerometer is working
+      if (newStatus.accelerometer) {
+        newStatus.pedometer = true;
+      }
+      
+      setSensorInitStatus(newStatus);
+    }
+  
+    // Original code for mapping
     if (mappingState === 'mapping' && sensorData) {
       mappingProcessor.processSensorData(sensorData);
       pointsRef.current = mappingProcessor.getPoints();
       setCurrentPoints([...pointsRef.current]);
-      
       // Update sensor readings for UI display
       setSensorReadings({
         heading: mappingProcessor.getCurrentHeading(),
@@ -98,13 +241,60 @@ export const MappingScreen: React.FC = () => {
     }
   }, [mappingState, sensorData]);
 
-  // Check if a project is selected
+  // Stop tracking function
+  const stopTracking = useCallback(() => {
+    if (isTracking) {
+      // Stop tracking in the app context
+      stopMapping();
+      
+      // Additional cleanup if needed
+      if (magnetometerSubscriptionRef.current) {
+        magnetometerSubscriptionRef.current.remove();
+        magnetometerSubscriptionRef.current = null;
+      }
+      if (accelerometerSubscriptionRef.current) {
+        accelerometerSubscriptionRef.current.remove();
+        accelerometerSubscriptionRef.current = null;
+      }
+      if (gyroscopeSubscriptionRef.current) {
+        gyroscopeSubscriptionRef.current.remove();
+        gyroscopeSubscriptionRef.current = null;
+      }
+    }
+  }, [isTracking, stopMapping]);
+  
+  // Cleanup useEffect
+  useEffect(() => {
+    return () => {
+      // Clear any existing intervals
+      if (sensorCheckIntervalRef.current) {
+        clearInterval(sensorCheckIntervalRef.current);
+      }
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+      }
+      
+      // Stop sensor tracking if active
+      if (isTracking) {
+        stopTracking();
+      }
+    };
+  }, [isTracking, stopTracking]);
+
+  // Check if a project is selected and handle initialization
   useEffect(() => {
     if (!currentProject) {
+      // If no project, go back to home screen
       navigation.navigate('Home' as never);
-    } else if (currentProject.floors.length === 0) {
-      // If there are no floors, open the floor manager modal
-      setFloorManagerVisible(true);
+      return;
+    } 
+    
+    // If there are no floors, show the floor manager modal
+    if (currentProject.floors.length === 0) {
+      console.log('No floors found, showing floor manager');
+      setTimeout(() => {
+        setFloorManagerVisible(true);
+      }, 500); // Short delay to ensure component is fully mounted
     }
   }, [currentProject, navigation]);
 
@@ -131,10 +321,17 @@ export const MappingScreen: React.FC = () => {
       return;
     }
     
+    // Reset the mapping processor
     mappingProcessor.reset();
     pointsRef.current = [];
     setCurrentPoints([]);
-    startMapping();
+    
+    // Initialize sensors first
+    initializeSensors().then(async (success) => {
+      if (success) {
+        startMapping();
+      }
+    });
   };
 
   // Pause mapping
@@ -181,7 +378,6 @@ export const MappingScreen: React.FC = () => {
       );
     }
   };
-
   // Add a feature to the current wall
   const handleAddFeature = (featureType: FeatureType) => {
     if (mappingState !== 'completed') {
@@ -231,45 +427,135 @@ export const MappingScreen: React.FC = () => {
     );
   };
 
-  // Calibrate the compass
-  const handleCalibrate = () => {
-    if (!sensorsAvailable.magnetometer) {
-      Alert.alert(
-        'Sensor Unavailable',
-        'Compass (magnetometer) is not available on this device.'
-      );
-      return;
-    }
-    
-    setIsCalibrating(true);
-    
+// Calibrate the compass
+// Improved compass calibration
+const handleCalibrate = () => {
+  // Check if magnetometer is available
+  if (!sensorsAvailable.magnetometer) {
     Alert.alert(
-      'Compass Calibration',
-      'Point your phone to North and hold it steady for 3 seconds.',
-      [{ text: 'Cancel', onPress: () => setIsCalibrating(false) }]
+      'Sensor Unavailable',
+      'Compass (magnetometer) is not available on this device.',
+      [{ text: 'OK' }]
     );
+    return;
+  }
+  
+  // Set calibrating state to show the overlay
+  setIsCalibrating(true);
+  setCalibrationCountdown(3);
+  
+  // Store multiple readings for better accuracy
+  const readings: number[] = [];
+  
+  // Create countdown interval
+  const countdownInterval = setInterval(() => {
+    setCalibrationCountdown(prev => {
+      if (prev <= 1) {
+        clearInterval(countdownInterval);
+        return 0;
+      }
+      return prev - 1;
+    });
+  }, 1000);
+  
+  // Use the current magnetometer readings for calibration
+  const collectReadings = () => {
+    if (sensorData?.magnetometer) {
+      // Calculate heading from magnetometer data
+      const heading = Math.atan2(
+        sensorData.magnetometer.y,
+        sensorData.magnetometer.x
+      ) * (180 / Math.PI);
+      
+      // Normalize heading to 0-360 range
+      const normalizedHeading = (heading + 360) % 360;
+      
+      // Add to readings array
+      readings.push(normalizedHeading);
+      
+      // Keep only the last 10 readings
+      if (readings.length > 10) {
+        readings.shift();
+      }
+    }
+  };
+  
+  // Collect readings every 100ms
+  const readingInterval = setInterval(collectReadings, 100);
+  
+  // Use the average of multiple readings for calibration after 3 seconds
+  timerRef.current = setTimeout(() => {
+    // Clean up
+    clearInterval(countdownInterval);
+    clearInterval(readingInterval);
     
-    // Use the current magnetometer reading for calibration
-    if (sensorData.magnetometer) {
-      timerRef.current = setTimeout(() => {
-        const heading = Math.atan2(
-          sensorData.magnetometer!.y,
-          sensorData.magnetometer!.x
-        ) * (180 / Math.PI);
+    // Check if we have enough readings
+    if (readings.length >= 5) {
+      try {
+        // Calculate average heading (excluding outliers)
+        readings.sort((a, b) => a - b);
+        // Remove potential outliers (first and last reading)
+        const filteredReadings = readings.length > 2 ? readings.slice(1, -1) : readings;
+        const sum = filteredReadings.reduce((acc, val) => acc + val, 0);
+        const avgHeading = sum / filteredReadings.length;
         
-        mappingProcessor.calibrate(heading);
+        // Apply calibration to the mapping processor
+        mappingProcessor.calibrate(avgHeading);
+        
+        // Hide the calibration overlay
         setIsCalibrating(false);
         
-        Alert.alert('Calibration Complete', 'Compass has been calibrated.');
-      }, 3000);
+        // Show success message with the calibrated heading
+        Alert.alert(
+          'Calibration Complete', 
+          `Compass has been calibrated to ${Math.round(avgHeading)}° from magnetic North.`,
+          [{ text: 'OK' }]
+        );
+      } catch (error) {
+        console.error('Calibration error:', error);
+        setIsCalibrating(false);
+        Alert.alert(
+          'Calibration Error',
+          'An error occurred during calibration. Please try again.',
+          [{ text: 'OK' }]
+        );
+      }
+    } else {
+      // Hide the calibration overlay
+      setIsCalibrating(false);
+      
+      // Show error message
+      Alert.alert(
+        'Calibration Failed',
+        'Could not get reliable compass readings. Please try again in an open area away from electronic devices and metal objects.',
+        [{ text: 'Try Again', onPress: handleCalibrate },
+         { text: 'OK' }]
+      );
     }
     
-    return () => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-    };
+    // Reset the timer reference
+    timerRef.current = null;
+  }, 3000);
+};
+
+// Function to handle cancellation
+const cancelCalibration = () => {
+  if (timerRef.current) {
+    clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
+  
+  setIsCalibrating(false);
+};
+
+// Make sure to clean up the timer in useEffect
+useEffect(() => {
+  return () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+    }
   };
+}, []);
 
   // Open the map exporter
   const handleExport = () => {
@@ -504,6 +790,67 @@ export const MappingScreen: React.FC = () => {
           visible={isMapExporterVisible}
           onClose={() => setMapExporterVisible(false)}
         />
+        
+        {/* Sensor Initialization Overlay */}
+      {/* Sensor Initialization Overlay */}
+{/* Sensor Initialization Overlay */}
+{isSensorInitializing && (
+  <View style={styles.sensorInitOverlay}>
+    <ActivityIndicator size="large" color="#2196F3" />
+    <Text style={styles.sensorInitText}>Initializing Sensors...</Text>
+    <View style={styles.sensorInitContainer}>
+      <View style={styles.sensorInitRow}>
+        <Text style={styles.sensorInitLabel}>Accelerometer:</Text>
+        <View style={[
+          styles.sensorInitIndicator, 
+          {backgroundColor: sensorInitStatus.accelerometer ? '#4CAF50' : '#9E9E9E'}
+        ]} />
+      </View>
+      
+      <View style={styles.sensorInitRow}>
+        <Text style={styles.sensorInitLabel}>Compass:</Text>
+        <View style={[
+          styles.sensorInitIndicator, 
+          {backgroundColor: sensorInitStatus.magnetometer ? '#4CAF50' : '#9E9E9E'}
+        ]} />
+      </View>
+      
+      <View style={styles.sensorInitRow}>
+        <Text style={styles.sensorInitLabel}>Step Detection:</Text>
+        <View style={[
+          styles.sensorInitIndicator, 
+          {backgroundColor: sensorInitStatus.pedometer ? '#4CAF50' : '#9E9E9E'}
+        ]} />
+      </View>
+    </View>
+  </View>
+)}
+
+{/* Compass Calibration Overlay */}
+{isCalibrating && (
+  <View style={styles.calibrationOverlay}>
+    <View style={styles.calibrationContainer}>
+      <ActivityIndicator size="large" color="#2196F3" />
+      <Text style={styles.calibrationText}>
+        Calibrating Compass... ({calibrationCountdown})
+      </Text>
+      <Text style={styles.calibrationInstructions}>
+        Point your device to North and hold steady.{'\n\n'}
+        For best results:{'\n'}
+        • Move away from electronic devices{'\n'}
+        • Stay away from metal objects{'\n'}
+        • Hold your phone flat and level
+      </Text>
+      <TouchableOpacity 
+        style={styles.cancelButton} 
+        onPress={cancelCalibration}
+      >
+        <Text style={styles.cancelButtonText}>Cancel</Text>
+      </TouchableOpacity>
+    </View>
+  </View>
+)}
+      
       </SafeAreaView>
     </ImageBackground>
   );
@@ -714,5 +1061,94 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginLeft: 8,
     flex: 1,
+  },
+
+  // Sensor initialization styles
+  sensorInitOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  sensorInitText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 16,
+    marginBottom: 24,
+  },
+  sensorInitContainer: {
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    padding: 16,
+    borderRadius: 12,
+    width: '80%',
+    maxWidth: 300,
+  },
+  sensorInitRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  sensorInitLabel: {
+    fontSize: 14,
+    color: '#333',
+    marginRight: 8,
+  },
+  sensorInitIndicator: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+  },
+  
+  // Calibration styles
+  calibrationOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  calibrationContainer: {
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    padding: 20,
+    borderRadius: 12,
+    alignItems: 'center',
+    width: '80%',
+    maxWidth: 300,
+  },
+  calibrationText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 16,
+    color: '#2196F3',
+  },
+  calibrationInstructions: {
+    fontSize: 14,
+    textAlign: 'center',
+    marginTop: 8,
+    marginBottom: 16,
+    color: '#555',
+  },
+  cancelButton: {
+    marginTop: 16,
+    padding: 8,
+    backgroundColor: '#f44336',
+    borderRadius: 4,
+    width: '80%',
+  },
+  cancelButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+    textAlign: 'center',
   },
 });

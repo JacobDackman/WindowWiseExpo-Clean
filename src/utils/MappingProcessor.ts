@@ -1,4 +1,5 @@
 import { Point, AppSettings, SensorData } from '../types';
+import { ENV } from '../config/env';
 
 /**
  * The MappingProcessor handles the conversion of raw sensor data
@@ -33,90 +34,152 @@ export class MappingProcessor {
     this.points.push({ x: 0, y: 0 });
   }
   
+  private validateSensorData(sensorData: SensorData): { isValid: boolean; errors: string[] } {
+    const errors: string[] = [];
+    
+    // Check for required sensor data
+    if (!sensorData.accelerometer) {
+      errors.push('Missing accelerometer data');
+    }
+    if (!sensorData.magnetometer) {
+      errors.push('Missing magnetometer data');
+    }
+    if (!sensorData.gyroscope) {
+      errors.push('Missing gyroscope data');
+    }
+
+    // Validate data quality
+    if (sensorData.accelerometer) {
+      const { x, y, z } = sensorData.accelerometer;
+      if (isNaN(x) || isNaN(y) || isNaN(z)) {
+        errors.push('Invalid accelerometer values');
+      }
+    }
+    if (sensorData.magnetometer) {
+      const { x, y, z } = sensorData.magnetometer;
+      if (isNaN(x) || isNaN(y) || isNaN(z)) {
+        errors.push('Invalid magnetometer values');
+      }
+    }
+    if (sensorData.gyroscope) {
+      const { x, y, z } = sensorData.gyroscope;
+      if (isNaN(x) || isNaN(y) || isNaN(z)) {
+        errors.push('Invalid gyroscope values');
+      }
+    }
+
+    return {
+      isValid: errors.length === 0,
+      errors
+    };
+  }
+  
   /**
    * Process new sensor data and update the tracked points.
    */
   processSensorData(sensorData: SensorData) {
     try {
-      // Update heading from magnetometer data
+      // Validate sensor data
+      const validation = this.validateSensorData(sensorData);
+      if (!validation.isValid) {
+        if (ENV.ENABLE_DEBUG_LOGGING) {
+          console.warn('Sensor data validation failed:', validation.errors);
+        }
+        return {
+          success: false,
+          errors: validation.errors
+        };
+      }
+
+      // Process magnetometer data for heading
+      let currentHeading: number | null = null;
+      let currentMovement: { distance: number; direction: number } | null = null;
+      let currentRotation: number | null = null;
+
       if (sensorData.magnetometer) {
-        this.updateHeading(sensorData.magnetometer);
+        currentHeading = this.calculateHeading(sensorData.magnetometer);
+        if (currentHeading === null) {
+          throw new Error('Failed to calculate heading from magnetometer data');
+        }
       }
-      
-      // Handle step detection and distance calculation
-      if (sensorData.pedometer && sensorData.pedometer.steps > this.stepCount) {
-        const newSteps = sensorData.pedometer.steps - this.stepCount;
-        this.stepCount = sensorData.pedometer.steps;
-        
-        // Calculate distance based on step length
-        const distance = newSteps * this.settings.stepLength;
-        this.totalDistance += distance;
-        
-        // Add a new point based on heading and distance
-        this.addPointFromHeadingAndDistance(distance);
+
+      // Process accelerometer data for movement
+      if (sensorData.accelerometer) {
+        currentMovement = this.calculateMovement(sensorData.accelerometer);
+        if (currentMovement === null) {
+          throw new Error('Failed to calculate movement from accelerometer data');
+        }
       }
-      
-      this.lastUpdateTime = Date.now();
-      
-      return true;
+
+      // Process gyroscope data for rotation
+      if (sensorData.gyroscope) {
+        currentRotation = this.calculateRotation(sensorData.gyroscope);
+        if (currentRotation === null) {
+          throw new Error('Failed to calculate rotation from gyroscope data');
+        }
+      }
+
+      return {
+        success: true,
+        heading: currentHeading,
+        movement: currentMovement,
+        rotation: currentRotation
+      };
+
     } catch (error) {
-      console.error('Error processing sensor data:', error);
-      return false;
+      if (ENV.ENABLE_DEBUG_LOGGING) {
+        console.error('Error processing sensor data:', error);
+      }
+      return {
+        success: false,
+        errors: [(error as Error).message]
+      };
     }
   }
   
-  /**
-   * Update the current heading based on magnetometer data.
-   */
-  private updateHeading(magnetometer: { x: number; y: number; z: number }) {
-    // Calculate heading in degrees (0-360)
-    // Heading is calculated based on magnetometer's x and y values
-    // atan2 returns values in the range (-PI, PI)
-    const radians = Math.atan2(magnetometer.y, magnetometer.x);
-    
-    // Convert to degrees and normalize to 0-360
-    let degrees = (radians * 180 / Math.PI) + 90;
-    if (degrees < 0) {
-      degrees += 360;
+  private calculateHeading(magnetometerData: { x: number; y: number; z: number }): number | null {
+    try {
+      // Implementation of heading calculation
+      const heading = Math.atan2(magnetometerData.y, magnetometerData.x);
+      return (heading * 180 / Math.PI + 360) % 360;
+    } catch (error) {
+      if (ENV.ENABLE_DEBUG_LOGGING) {
+        console.error('Error calculating heading:', error);
+      }
+      return null;
     }
-    degrees %= 360;
-    
-    // Apply calibration offset
-    this.heading = (degrees + this.calibrationOffset) % 360;
-    
-    // Optionally smooth heading with a moving average for stability
   }
   
-  /**
-   * Add a new point based on current heading and distance traveled.
-   */
-  private addPointFromHeadingAndDistance(distance: number) {
-    if (this.points.length === 0) {
-      this.points.push({ x: 0, y: 0 });
-      return;
+  private calculateMovement(accelerometerData: { x: number; y: number; z: number }): { distance: number; direction: number } | null {
+    try {
+      // Implementation of movement calculation
+      const magnitude = Math.sqrt(
+        accelerometerData.x * accelerometerData.x +
+        accelerometerData.y * accelerometerData.y
+      );
+      
+      const direction = Math.atan2(accelerometerData.y, accelerometerData.x);
+      return {
+        distance: magnitude * ENV.STEP_LENGTH,
+        direction: (direction * 180 / Math.PI + 360) % 360
+      };
+    } catch (error) {
+      if (ENV.ENABLE_DEBUG_LOGGING) {
+        console.error('Error calculating movement:', error);
+      }
+      return null;
     }
-    
-    const lastPoint = this.points[this.points.length - 1];
-    
-    // Convert heading to radians for trig functions
-    const radians = this.heading * (Math.PI / 180);
-    
-    // Calculate new point using trigonometry
-    // In this coordinate system:
-    // - x increases to the right
-    // - y increases going up
-    // - heading 0 is north (up), increases clockwise
-    const newX = lastPoint.x + distance * Math.sin(radians);
-    const newY = lastPoint.y + distance * Math.cos(radians);
-    
-    this.points.push({
-      x: newX,
-      y: newY
-    });
-    
-    // Check if we should simplify the points
-    if (this.points.length > 100) {
-      this.simplifyPoints();
+  }
+  
+  private calculateRotation(gyroscopeData: { x: number; y: number; z: number }): number | null {
+    try {
+      // Implementation of rotation calculation
+      return (Math.atan2(gyroscopeData.y, gyroscopeData.x) * 180 / Math.PI + 360) % 360;
+    } catch (error) {
+      if (ENV.ENABLE_DEBUG_LOGGING) {
+        console.error('Error calculating rotation:', error);
+      }
+      return null;
     }
   }
   

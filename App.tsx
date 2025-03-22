@@ -1,19 +1,34 @@
+// First, import the polyfill (must be first)
+import 'react-native-get-random-values';
+
+// Then import React and other dependencies (only once)
 import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { StyleSheet, View, Text, ActivityIndicator, ImageBackground } from 'react-native';
+import { StyleSheet, View, Text, ActivityIndicator, ImageBackground, LogBox } from 'react-native';
 import * as SplashScreen from 'expo-splash-screen';
 import { Asset } from 'expo-asset';
+import * as FileSystem from 'expo-file-system';
 
 import { AppProvider } from './src/contexts/AppContext';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { MappingScreen } from './src/screens/MappingScreen';
+import ErrorBoundary from './src/components/ErrorBoundary';
+
+// Rest of your code...
+
+// Ignore specific harmless warnings
+LogBox.ignoreLogs([
+  'Asyncstorage has been extracted',
+  'Require cycle:',
+  'Non-serializable values were found in the navigation state',
+]);
 
 // Prevent the splash screen from auto-hiding
-SplashScreen.preventAutoHideAsync().catch(() => {
-  /* If this fails, it's not fatal to the app */
+SplashScreen.preventAutoHideAsync().catch((error) => {
+  console.warn('Error preventing splash screen auto-hide:', error);
 });
 
 // Define the navigation stack
@@ -27,7 +42,20 @@ export default function App() {
   useEffect(() => {
     const prepare = async () => {
       try {
-        // Pre-load assets if needed
+        // Pre-load assets
+        const images = [
+          require('./assets/icon.png'),
+          require('./assets/splash.png'),
+          require('./assets/adaptive-icon.png'),
+        ];
+        
+        // Cache images
+        const cacheImages = images.map(image => {
+          return Asset.fromModule(image).downloadAsync();
+        });
+        
+        // Wait for assets to load
+        await Promise.all(cacheImages);
         
         // Artificial small delay to ensure everything is ready
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -72,30 +100,34 @@ export default function App() {
 
   // Main app
   return (
-    <SafeAreaProvider>
-      <StatusBar style="auto" />
-      <AppProvider>
-        <ImageBackground 
-          source={require('./assets/splash.png')} 
-          style={styles.backgroundImage}
-          imageStyle={{ opacity: 0.12 }}
-        >
-          <NavigationContainer>
-            <Stack.Navigator 
-              initialRouteName="Home"
-              screenOptions={{
-                headerShown: false,
-                animation: 'slide_from_right',
-                contentStyle: { backgroundColor: 'transparent' },
-              }}
-            >
-              <Stack.Screen name="Home" component={HomeScreen} />
-              <Stack.Screen name="Mapping" component={MappingScreen} />
-            </Stack.Navigator>
-          </NavigationContainer>
-        </ImageBackground>
-      </AppProvider>
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <StatusBar style="auto" />
+        <AppProvider>
+          <ImageBackground 
+            source={require('./assets/splash.png')} 
+            style={styles.backgroundImage}
+            imageStyle={{ opacity: 0.12 }}
+          >
+            <NavigationContainer fallback={<Text>Loading navigation...</Text>}>
+              <ErrorBoundary>
+                <Stack.Navigator 
+                  initialRouteName="Home"
+                  screenOptions={{
+                    headerShown: false,
+                    animation: 'slide_from_right',
+                    contentStyle: { backgroundColor: 'transparent' },
+                  }}
+                >
+                  <Stack.Screen name="Home" component={HomeScreen} />
+                  <Stack.Screen name="Mapping" component={MappingScreen} />
+                </Stack.Navigator>
+              </ErrorBoundary>
+            </NavigationContainer>
+          </ImageBackground>
+        </AppProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 

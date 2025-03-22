@@ -18,13 +18,14 @@ import {
   Point,
   SensorData,
 } from '../types';
+import { ENV } from '../config/env';
 
 // Default settings
 const defaultSettings: AppSettings = {
-  stepLength: 0.75, // Average step length in meters
-  autoSaveInterval: 60000, // Auto-save every minute
-  showMeasurements: true,
-  highAccuracyMode: false,
+  stepLength: ENV.STEP_LENGTH,
+  autoSaveInterval: ENV.AUTO_SAVE_INTERVAL,
+  showMeasurements: ENV.SHOW_MEASUREMENTS,
+  highAccuracyMode: ENV.ENABLE_HIGH_ACCURACY_MODE,
 };
 
 // Storage keys
