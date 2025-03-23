@@ -22,7 +22,12 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "com.jacobdackman.WindowWiseExpoClean"
+      "package": "com.jacobdackman.WindowWiseExpoClean",
+      "permissions": [
+        "android.permission.BODY_SENSORS",
+        "android.permission.HIGH_SAMPLING_RATE_SENSORS",
+        "android.permission.ACTIVITY_RECOGNITION"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -40,6 +45,14 @@
       "AUTO_SAVE_INTERVAL": 60000,
       "SHOW_MEASUREMENTS": true
     },
-    "owner": "jacobdackman"
+    "owner": "jacobdackman",
+    "plugins": [
+      [
+        "expo-sensors",
+        {
+          "motionPermission": "Allow WindowWise to access your device motion and orientation"
+        }
+      ]
+    ]
   }
 }

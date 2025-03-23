@@ -8,6 +8,10 @@ import {
   FlatList,
   TouchableOpacity,
   Alert,
+  KeyboardAvoidingView,
+  TouchableWithoutFeedback,
+  Keyboard,
+  Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../contexts/AppContext';
@@ -129,82 +133,87 @@ export const FloorManager: React.FC<FloorManagerProps> = ({
       transparent={true}
       onRequestClose={onClose}
     >
-      <View style={styles.modalOverlay}>
-        <View style={styles.modalContent}>
-          {/* Header */}
-          <View style={styles.header}>
-            <Text style={styles.title}>Floor Manager</Text>
-            <TouchableOpacity onPress={onClose} style={styles.closeButton}>
-              <Ionicons name="close" size={24} color="#333" />
-            </TouchableOpacity>
-          </View>
-          
-          {/* Project name */}
-          <Text style={styles.projectName}>
-            Project: {currentProject?.name}
-          </Text>
-          
-          {/* Floor list */}
-          <FlatList
-            data={currentProject?.floors || []}
-            renderItem={renderFloorItem}
-            keyExtractor={(item) => item.id}
-            ListEmptyComponent={renderEmptyList}
-            style={styles.floorList}
-            contentContainerStyle={styles.floorListContent}
-          />
-          
-          {/* Add floor form */}
-          {isAddingFloor ? (
-            <View style={styles.addFloorForm}>
-              <TextInput
-                style={styles.input}
-                value={newFloorName}
-                onChangeText={setNewFloorName}
-                placeholder="Floor name (e.g., Ground Floor)"
-                autoFocus
-              />
-              
-              <View style={styles.formButtons}>
-                <Button
-                  title="Cancel"
-                  onPress={() => {
-                    setIsAddingFloor(false);
-                    setNewFloorName('');
-                  }}
-                  type="secondary"
+      <KeyboardAvoidingView 
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        style={styles.container}
+      >
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View style={styles.modalContent}>
+            {/* Header */}
+            <View style={styles.header}>
+              <Text style={styles.title}>Floor Manager</Text>
+              <TouchableOpacity onPress={onClose} style={styles.closeButton}>
+                <Ionicons name="close" size={24} color="#333" />
+              </TouchableOpacity>
+            </View>
+            
+            {/* Project name */}
+            <Text style={styles.projectName}>
+              Project: {currentProject?.name}
+            </Text>
+            
+            {/* Floor list */}
+            <FlatList
+              data={currentProject?.floors || []}
+              renderItem={renderFloorItem}
+              keyExtractor={(item) => item.id}
+              ListEmptyComponent={renderEmptyList}
+              style={styles.floorList}
+              contentContainerStyle={styles.floorListContent}
+            />
+            
+            {/* Add floor form */}
+            {isAddingFloor ? (
+              <View style={styles.addFloorForm}>
+                <TextInput
+                  style={styles.input}
+                  value={newFloorName}
+                  onChangeText={setNewFloorName}
+                  placeholder="Floor name (e.g., Ground Floor)"
+                  autoFocus
                 />
                 
-                <Button
-                  title="Create"
-                  onPress={handleCreateFloor}
-                  disabled={!newFloorName.trim()}
-                />
+                <View style={styles.formButtons}>
+                  <Button
+                    title="Cancel"
+                    onPress={() => {
+                      setIsAddingFloor(false);
+                      setNewFloorName('');
+                    }}
+                    type="secondary"
+                  />
+                  
+                  <Button
+                    title="Create"
+                    onPress={handleCreateFloor}
+                    disabled={!newFloorName.trim()}
+                  />
+                </View>
               </View>
-            </View>
-          ) : (
-            <Button
-              title="Add New Floor"
-              onPress={() => setIsAddingFloor(true)}
-              type="primary"
-              icon={
-                <Ionicons
-                  name="add-circle-outline"
-                  size={18}
-                  color="white"
-                  style={{ marginRight: 6 }}
-                />
-              }
-            />
-          )}
-        </View>
-      </View>
+            ) : (
+              <Button
+                title="Add New Floor"
+                onPress={() => setIsAddingFloor(true)}
+                type="primary"
+                icon={
+                  <Ionicons
+                    name="add-circle-outline"
+                    size={18}
+                    color="white"
+                    style={{ marginRight: 6 }}
+                  />
+                }
+              />
+            )}
+          </View>
+        </TouchableWithoutFeedback>
+      </KeyboardAvoidingView>
     </Modal>
   );
 };
 
 const styles = StyleSheet.create({
-  modalOverlay: {
+  container: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'center',

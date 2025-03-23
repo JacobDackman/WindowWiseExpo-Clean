@@ -60,5 +60,17 @@
     "rimraf": "^4.4.1",
     "typescript": "^5.3.3"
   },
-  "private": true
+  "private": true,
+  "resolutions": {
+    "@react-navigation/core": "^7.0.0",
+    "@react-navigation/native": "^7.0.0",
+    "react-native-screens": "~4.4.0"
+  },
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "listUnknownPackages": false
+      }
+    }
+  }
 }

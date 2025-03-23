@@ -1,47 +1,75 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Platform } from 'react-native';
+import { Platform, Linking, AppState } from 'react-native';
 import { Gyroscope, Magnetometer, Accelerometer } from 'expo-sensors';
 import * as Device from 'expo-device';
-import { SensorData, SensorsAvailability } from '../types';
+import { SensorsAvailability } from '../types';
 import { ENV } from '../config/env';
-import { PermissionsAndroid } from 'react-native';
-import { Alert } from 'react-native';
+import { PermissionsAndroid, Alert } from 'react-native';
+
+// Define the ThreeAxisMeasurement type ourselves since it's not exported
+interface ThreeAxisMeasurement {
+  x: number;
+  y: number;
+  z: number;
+}
 
 // Configuration for step detection
-const STEP_DETECTION_CONFIG = {
+interface SensorConfig {
+  THRESHOLD: number;
+  DEBOUNCE_TIME: number;
+  WINDOW_SIZE: number;
+  UPDATE_INTERVAL: number;
+  MAX_RETRIES: number;
+  RETRY_DELAY: number;
+  DATA_TIMEOUT: number;
+  MAX_SENSOR_VALUE: number;
+  INITIALIZATION_TIMEOUT: number;
+}
+
+const STEP_DETECTION_CONFIG: SensorConfig = {
   THRESHOLD: Platform.select({
     ios: 1.2,
-    android: 1.0,
+    android: 0.8,
     default: 1.2,
   }),
   DEBOUNCE_TIME: Platform.select({
     ios: 250,
-    android: 300,
+    android: 350,
     default: 250,
   }),
   WINDOW_SIZE: Platform.select({
     ios: 5,
-    android: 7,
+    android: 9,
     default: 5,
   }),
   UPDATE_INTERVAL: Platform.select({
     ios: 100,
-    android: 150,
+    android: 200,
     default: 100,
   }),
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 1000,
+  DATA_TIMEOUT: 5000,
+  MAX_SENSOR_VALUE: Platform.select({
+    ios: 20,
+    android: 25,
+    default: 20,
+  }),
+  INITIALIZATION_TIMEOUT: 10000, // 10 seconds max for initialization
 };
 
 // Android-specific sensor setup
-const setupAndroidSensors = async () => {
+const setupAndroidSensors = async (): Promise<boolean> => {
   if (Platform.OS === 'android') {
     try {
-      // Request permissions if needed (some Android devices require this)
-      if (await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BODY_SENSORS) === false) {
+      // Request permissions if needed
+      const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BODY_SENSORS);
+      if (!hasPermission) {
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.BODY_SENSORS,
           {
             title: "Sensor Permission",
-            message: "This app needs access to device sensors for mapping functionality",
+            message: "WindowWise needs access to device sensors for mapping functionality",
             buttonNeutral: "Ask Me Later",
             buttonNegative: "Cancel",
             buttonPositive: "OK"
@@ -68,20 +96,52 @@ const setupAndroidSensors = async () => {
   return true;
 };
 
-export function useSensors(options?: {
+// Define proper types for our sensor data
+interface SensorSubscription {
+  remove: () => void;
+}
+
+interface SensorSubscriptions {
+  accelerometer?: SensorSubscription;
+  gyroscope?: SensorSubscription;
+  magnetometer?: SensorSubscription;
+}
+
+interface SensorData {
+  accelerometer: ThreeAxisMeasurement;
+  gyroscope: ThreeAxisMeasurement;
+  magnetometer: ThreeAxisMeasurement;
+  pedometer: { steps: number };
+  timestamp: number;
+}
+
+interface SensorOptions {
   enabled?: boolean;
   updateInterval?: number;
-}) {
+}
+
+interface SensorHookResult {
+  isInitializing: boolean;
+  isTracking: boolean;
+  error: string | null;
+  sensorData: SensorData;
+  sensorsAvailable: SensorsAvailability;
+  start: () => Promise<boolean>;
+  stop: () => void;
+  reset: () => void;
+}
+
+export function useSensors(options?: SensorOptions): SensorHookResult {
   const {
     enabled = true,
     updateInterval = STEP_DETECTION_CONFIG.UPDATE_INTERVAL,
   } = options || {};
 
   // State declarations
-  const [isInitializing, setIsInitializing] = useState(false);
-  const [retryAttempts, setRetryAttempts] = useState(0);
+  const [isInitializing, setIsInitializing] = useState<boolean>(false);
+  const [retryAttempts, setRetryAttempts] = useState<number>(0);
   const [error, setError] = useState<string | null>(null);
-  const [isTracking, setIsTracking] = useState(false);
+  const [isTracking, setIsTracking] = useState<boolean>(false);
   const [sensorsAvailable, setSensorsAvailable] = useState<SensorsAvailability>({
     accelerometer: false,
     gyroscope: false,
@@ -91,47 +151,55 @@ export function useSensors(options?: {
 
   // Sensor data state
   const [sensorData, setSensorData] = useState<SensorData>({
-    timestamp: Date.now(),
+    accelerometer: { x: 0, y: 0, z: 0 },
+    gyroscope: { x: 0, y: 0, z: 0 },
+    magnetometer: { x: 0, y: 0, z: 0 },
+    pedometer: { steps: 0 },
+    timestamp: Date.now()
   });
 
   // Step detection state
-  const [stepCount, setStepCount] = useState(0);
+  const [stepCount, setStepCount] = useState<number>(0);
   const stepDetectorRef = useRef<number>(0);
-  const lastAccelerationRef = useRef<{ x: number; y: number; z: number } | null>(null);
+  const lastAccelerationRef = useRef<ThreeAxisMeasurement | null>(null);
   const accelerationWindowRef = useRef<number[]>([]);
 
   // Subscription refs
-  const subscriptionsRef = useRef<{
-    accelerometer: { remove: () => void } | null;
-    gyroscope: { remove: () => void } | null;
-    magnetometer: { remove: () => void } | null;
-  }>({
-    accelerometer: null,
-    gyroscope: null,
-    magnetometer: null,
-  });
+  const subscriptionsRef = useRef<SensorSubscriptions>({});
+  const initTimeoutRef = useRef<NodeJS.Timeout>();
 
   // Cleanup subscriptions
   const cleanupSubscriptions = useCallback(() => {
-    Object.values(subscriptionsRef.current).forEach(subscription => {
-      if (subscription) {
-        subscription.remove();
-      }
-    });
-    subscriptionsRef.current = {
-      accelerometer: null,
-      gyroscope: null,
-      magnetometer: null,
-    };
+    try {
+      // First remove all listeners
+      Object.values(subscriptionsRef.current).forEach(subscription => {
+        if (subscription?.remove) {
+          subscription.remove();
+        }
+      });
+      // Clear the subscriptions object
+      subscriptionsRef.current = {};
+      // Reset sensor data
+      setSensorData({
+        accelerometer: { x: 0, y: 0, z: 0 },
+        gyroscope: { x: 0, y: 0, z: 0 },
+        magnetometer: { x: 0, y: 0, z: 0 },
+        pedometer: { steps: 0 },
+        timestamp: 0,
+      });
+      setIsTracking(false);
+    } catch (error) {
+      console.error('Error cleaning up sensors:', error);
+    }
   }, []);
 
   // Step detection
-  const detectStep = useCallback((data: { x: number; y: number; z: number }) => {
+  const detectStep = useCallback((data: ThreeAxisMeasurement): boolean => {
     const now = Date.now();
     if (now - stepDetectorRef.current < STEP_DETECTION_CONFIG.DEBOUNCE_TIME) {
       return false;
     }
-
+    
     const acceleration = Math.sqrt(data.x ** 2 + data.y ** 2 + data.z ** 2);
     accelerationWindowRef.current.push(acceleration);
 
@@ -149,300 +217,250 @@ export function useSensors(options?: {
         return true;
       }
     }
-
+    
     return false;
   }, []);
 
-  // Start sensors function
-  const startSensors = useCallback(async (): Promise<boolean> => {
+  const checkSensorAvailability = async () => {
     try {
+      const magnetometerAvailable = await Magnetometer.isAvailableAsync();
+      if (!magnetometerAvailable) {
+        Alert.alert(
+          'Compass Sensor Required',
+          'Your device\'s compass (magnetometer) sensor is not available. This may happen because:\n\n' +
+          '1. Your device doesn\'t have a compass sensor\n' +
+          '2. Compass access is disabled in settings\n' +
+          '3. Battery saver mode is interfering\n' +
+          '4. Another app is using the compass\n\n' +
+          'To resolve this:\n' +
+          '• Check device settings and enable all sensors\n' +
+          '• Disable battery saver mode\n' +
+          '• Restart your device\n' +
+          '• Note: Some devices may not support accurate mapping',
+          [
+            { 
+              text: 'Open Settings', 
+              onPress: () => Linking.openSettings() 
+            },
+            { 
+              text: 'Try Again', 
+              onPress: () => initializeSensors() 
+            },
+            { text: 'Cancel' }
+          ]
+        );
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error('[Sensors] Error checking magnetometer:', error);
+      return false;
+    }
+  };
+
+  const initializeSensors = useCallback(async (): Promise<boolean> => {
+    try {
+      if (isTracking) {
+        cleanupSubscriptions();
+      }
+
       setIsInitializing(true);
       setError(null);
 
-      // Clean up any existing subscriptions first
-      cleanupSubscriptions();
+      // Add initialization timeout
+      const initializationTimeout = new Promise<boolean>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('Sensor initialization timeout'));
+        }, STEP_DETECTION_CONFIG.INITIALIZATION_TIMEOUT);
+      });
 
-      // First check if sensors are available
-      const [accelerometerAvailable, gyroscopeAvailable, magnetometerAvailable] = 
-        await Promise.all([
+      // Race between initialization and timeout
+      const initializeWithTimeout = async (): Promise<boolean> => {
+        const androidSetup = await setupAndroidSensors();
+        if (!androidSetup) {
+          throw new Error('Android sensor setup failed');
+        }
+
+        const [accelAvailable, magAvailable, gyroAvailable] = await Promise.all([
           Accelerometer.isAvailableAsync(),
-          Gyroscope.isAvailableAsync(),
           Magnetometer.isAvailableAsync(),
+          Gyroscope.isAvailableAsync()
         ]);
 
-      console.log('Sensor availability:', {
-        accelerometer: accelerometerAvailable,
-        gyroscope: gyroscopeAvailable,
-        magnetometer: magnetometerAvailable,
-      });
+        setSensorsAvailable({
+          accelerometer: accelAvailable,
+          magnetometer: magAvailable,
+          gyroscope: gyroAvailable,
+          pedometer: false
+        });
 
-      // Update sensor availability state
-      setSensorsAvailable({
-        accelerometer: accelerometerAvailable,
-        gyroscope: gyroscopeAvailable,
-        magnetometer: magnetometerAvailable,
-        pedometer: accelerometerAvailable,
-      });
+        if (!accelAvailable || !magAvailable) {
+          throw new Error('Required sensors not available');
+        }
 
-      // If required sensors are not available, return false
-      if (!accelerometerAvailable || !magnetometerAvailable) {
-        const missingSensors = [];
-        if (!accelerometerAvailable) missingSensors.push('accelerometer');
-        if (!magnetometerAvailable) missingSensors.push('magnetometer');
-        setError(`Required sensors not available: ${missingSensors.join(', ')}`);
-        setIsInitializing(false);
-        return false;
-      }
+        let receivedData = {
+          accelerometer: false,
+          magnetometer: false,
+          gyroscope: false
+        };
 
-      // Set update intervals first
-      await Promise.all([
-        Accelerometer.setUpdateInterval(STEP_DETECTION_CONFIG.UPDATE_INTERVAL),
-        Gyroscope.setUpdateInterval(STEP_DETECTION_CONFIG.UPDATE_INTERVAL),
-        Magnetometer.setUpdateInterval(STEP_DETECTION_CONFIG.UPDATE_INTERVAL),
-      ]);
+        const dataPromise = new Promise<boolean>((resolve, reject) => {
+          let dataTimeout: NodeJS.Timeout;
 
-      // Set up direct subscriptions
-      subscriptionsRef.current.accelerometer = Accelerometer.addListener(accelerometerData => {
-        const isStep = detectStep(accelerometerData);
-        setSensorData(prev => ({
-          ...prev,
-          accelerometer: accelerometerData,
-          pedometer: { steps: stepCount + (isStep ? 1 : 0) },
-          timestamp: Date.now(),
-        }));
-      });
-
-      subscriptionsRef.current.gyroscope = Gyroscope.addListener(gyroscopeData => {
-        setSensorData(prev => ({
-          ...prev,
-          gyroscope: gyroscopeData,
-          timestamp: Date.now(),
-        }));
-      });
-
-      subscriptionsRef.current.magnetometer = Magnetometer.addListener(magnetometerData => {
-        setSensorData(prev => ({
-          ...prev,
-          magnetometer: magnetometerData,
-          timestamp: Date.now(),
-        }));
-      });
-
-      // Wait for initial data from sensors
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          const checkData = setInterval(() => {
-            if (sensorData.accelerometer && sensorData.magnetometer) {
-              clearInterval(checkData);
-              resolve();
+          const checkDataReceived = () => {
+            if (receivedData.accelerometer && receivedData.magnetometer) {
+              clearTimeout(dataTimeout);
+              resolve(true);
             }
-          }, 100);
-        }),
-        new Promise<void>((_, reject) => 
-          setTimeout(() => reject(new Error('Timeout waiting for sensor data')), 5000)
-        ),
-      ]);
+          };
 
+          subscriptionsRef.current.accelerometer = Accelerometer.addListener(
+            (data: ThreeAxisMeasurement) => {
+              receivedData.accelerometer = true;
+              setSensorData(prev => ({
+                ...prev,
+                accelerometer: data,
+                timestamp: Date.now()
+              }));
+              detectStep(data);
+              checkDataReceived();
+            }
+          );
+
+          subscriptionsRef.current.magnetometer = Magnetometer.addListener(
+            (data: ThreeAxisMeasurement) => {
+              receivedData.magnetometer = true;
+              setSensorData(prev => ({
+                ...prev,
+                magnetometer: data,
+                timestamp: Date.now()
+              }));
+              checkDataReceived();
+            }
+          );
+
+          if (gyroAvailable) {
+            subscriptionsRef.current.gyroscope = Gyroscope.addListener(
+              (data: ThreeAxisMeasurement) => {
+                receivedData.gyroscope = true;
+                setSensorData(prev => ({
+                  ...prev,
+                  gyroscope: data,
+                  timestamp: Date.now()
+                }));
+              }
+            );
+          }
+
+          dataTimeout = setTimeout(() => {
+            reject(new Error('No sensor data received within timeout'));
+          }, STEP_DETECTION_CONFIG.DATA_TIMEOUT);
+        });
+
+        await dataPromise;
+        return true;
+      };
+
+      await Promise.race([initializeWithTimeout(), initializationTimeout]);
       setIsTracking(true);
       setIsInitializing(false);
       return true;
+
     } catch (error) {
-      console.error('Error starting sensors:', error);
+      console.error('[Sensors] Initialization error:', error);
       cleanupSubscriptions();
-      setError(`Failed to start sensors: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to initialize sensors';
+      setError(errorMessage);
       setIsInitializing(false);
-      return false;
-    }
-  }, [detectStep, stepCount, cleanupSubscriptions, sensorData]);
-
-  // Check sensor availability
-  const checkSensors = useCallback(async () => {
-    try {
-      const [accelerometerAvailable, gyroscopeAvailable, magnetometerAvailable] = 
-        await Promise.all([
-          Accelerometer.isAvailableAsync(),
-          Gyroscope.isAvailableAsync(),
-          Magnetometer.isAvailableAsync(),
-        ]);
-
-      // For Android, we use accelerometer for step detection
-      // For iOS, we check device capabilities
-      let pedometerAvailable = false;
-      if (Platform.OS === 'ios') {
-        const deviceInfo = await Device.getDeviceTypeAsync();
-        pedometerAvailable = deviceInfo !== Device.DeviceType.UNKNOWN;
-      } else {
-        pedometerAvailable = accelerometerAvailable;
-      }
-
-      setSensorsAvailable({
-        accelerometer: accelerometerAvailable,
-        gyroscope: gyroscopeAvailable,
-        magnetometer: magnetometerAvailable,
-        pedometer: pedometerAvailable,
-      });
-
-      return {
-        accelerometer: accelerometerAvailable,
-        gyroscope: gyroscopeAvailable,
-        magnetometer: magnetometerAvailable,
-        pedometer: pedometerAvailable,
-      };
-    } catch (err) {
-      console.error('Error checking sensor availability:', err);
-      setError('Failed to check sensor availability');
-      return null;
-    }
-  }, []);
-
-  // Initialize sensors with configuration
-  const initializeSensors = useCallback(async (): Promise<boolean> => {
-    try {
-      setIsInitializing(true);
-
-      // Setup Android-specific configurations first
-      const androidSetupSuccess = await setupAndroidSensors();
-      if (!androidSetupSuccess) {
-        setError('Failed to setup Android sensors');
-        return false;
-      }
-
-      const success = await startSensors();
-      if (!success) {
-        setError('Failed to start sensors');
-        return false;
-      }
-
-      // Verify sensor availability
-      const requiredSensors = ['accelerometer', 'magnetometer'] as const;
-      const unavailableSensors = requiredSensors.filter(
-        sensor => !sensorsAvailable[sensor]
-      );
-
-      if (unavailableSensors.length > 0) {
-        console.error(
-          `Required sensors not available: ${unavailableSensors.join(', ')}`
-        );
-        return false;
-      }
-
-      // Additional Android-specific sensor checks
-      if (Platform.OS === 'android') {
-        // Check if sensors are providing valid data
-        const initialReadings = await Promise.race([
-          new Promise(resolve => {
-            const subscription = Accelerometer.addListener(data => {
-              subscription.remove();
-              resolve(data);
-            });
-          }),
-          new Promise(resolve => setTimeout(() => resolve(null), 1000))
-        ]);
-
-        if (!initialReadings) {
-          console.error('Failed to get initial sensor readings on Android');
-          return false;
-        }
-      }
-
-      setIsInitializing(false);
-      setRetryAttempts(0);
-      return true;
-    } catch (error) {
-      console.error('Sensor initialization error:', error);
       
-      if (retryAttempts < 3) {
-        setRetryAttempts(prev => prev + 1);
-        setTimeout(() => {
-          initializeSensors();
-        }, 1000 * (retryAttempts + 1));
-      } else {
-        setIsInitializing(false);
-        Alert.alert(
-          'Sensor Error',
-          'Failed to initialize sensors. Please check your device settings and try again.',
-          [
-            { text: 'OK' },
-            {
-              text: 'Retry',
-              onPress: () => {
-                setRetryAttempts(0);
+      Alert.alert(
+        'Sensor Error',
+        `${errorMessage}\n\nPlease check your device settings and try again.`,
+        [
+          { 
+            text: 'Open Settings',
+            onPress: () => Linking.openSettings()
+          },
+          { 
+            text: 'Try Again',
+            onPress: () => {
+              if (retryAttempts < STEP_DETECTION_CONFIG.MAX_RETRIES) {
+                setRetryAttempts(prev => prev + 1);
                 initializeSensors();
-              },
-            },
-          ]
-        );
-      }
+              } else {
+                Alert.alert(
+                  'Error',
+                  'Maximum retry attempts reached. Please restart the app and try again.',
+                  [{ text: 'OK' }]
+                );
+              }
+            }
+          },
+          { text: 'Cancel' }
+        ]
+      );
       return false;
     }
-  }, [startSensors, sensorsAvailable, retryAttempts]);
+  }, [cleanupSubscriptions, detectStep, isTracking, retryAttempts]);
+
+  const showCalibrationGuide = () => {
+    Alert.alert(
+      'Compass Calibration',
+      'To calibrate your device\'s compass:\n\n' +
+      '1. Move away from metal objects\n' +
+      '2. Wave your device in a figure-8 pattern\n' +
+      '3. Rotate your device on all axes\n' +
+      '4. Continue for 10-15 seconds\n\n' +
+      'Try mapping again after calibration.',
+      [{ text: 'OK' }]
+    );
+  };
 
   // Start tracking
   const startTracking = useCallback(async () => {
     try {
-      // Clean up any existing subscriptions
-      cleanupSubscriptions();
-
-      // Initialize sensors
-      const initialized = await initializeSensors();
-      if (!initialized) {
-        throw new Error('Failed to initialize sensors');
+      if (!isTracking) {
+        const initialized = await initializeSensors();
+        if (!initialized) {
+          throw new Error('Failed to initialize sensors');
+        }
       }
-
-      // Set up subscriptions
-      subscriptionsRef.current.accelerometer = Accelerometer.addListener(accelerometerData => {
-        const isStep = detectStep(accelerometerData);
-        setSensorData(prev => ({
-          ...prev,
-          accelerometer: accelerometerData,
-          pedometer: { steps: stepCount + (isStep ? 1 : 0) },
-          timestamp: Date.now(),
-        }));
-      });
-
-      subscriptionsRef.current.gyroscope = Gyroscope.addListener(gyroscopeData => {
-        setSensorData(prev => ({
-          ...prev,
-          gyroscope: gyroscopeData,
-          timestamp: Date.now(),
-        }));
-      });
-
-      subscriptionsRef.current.magnetometer = Magnetometer.addListener(magnetometerData => {
-        setSensorData(prev => ({
-          ...prev,
-          magnetometer: magnetometerData,
-          timestamp: Date.now(),
-        }));
-      });
-
-      setIsTracking(true);
       return true;
     } catch (error) {
-      console.error('Error starting sensor tracking:', error);
+      console.error('[Sensors] Start tracking error:', error);
       setError('Failed to start sensor tracking');
       return false;
     }
-  }, [cleanupSubscriptions, initializeSensors, detectStep, stepCount]);
+  }, [isTracking, initializeSensors]);
 
   // Stop tracking
   const stopTracking = useCallback(() => {
     cleanupSubscriptions();
-    setIsTracking(false);
   }, [cleanupSubscriptions]);
 
   // Effect for handling enabled state
   useEffect(() => {
+    let mounted = true;
+
     if (!enabled) {
       stopTracking();
       return;
     }
 
-    if (isTracking) {
-      startTracking();
-    }
+    const initialize = async () => {
+      try {
+        if (mounted) {
+          await startTracking();
+        }
+      } catch (error) {
+        console.error('[Sensors] Initialization effect error:', error);
+      }
+    };
+
+    initialize();
 
     return () => {
+      mounted = false;
       if (isTracking) {
         stopTracking();
       }
@@ -456,25 +474,47 @@ export function useSensors(options?: {
     };
   }, [cleanupSubscriptions]);
 
+  // Add AppState handling
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState: string) => {
+      if (nextAppState === 'active' && isTracking) {
+        // Reinitialize sensors when app comes to foreground
+        initializeSensors();
+      } else if (nextAppState === 'background') {
+        // Cleanup when app goes to background
+        cleanupSubscriptions();
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [initializeSensors, cleanupSubscriptions, isTracking]);
+
   const reset = useCallback(() => {
     setStepCount(0);
     lastAccelerationRef.current = null;
     stepDetectorRef.current = 0;
     accelerationWindowRef.current = [];
     setSensorData({
-      timestamp: Date.now(),
+      accelerometer: { x: 0, y: 0, z: 0 },
+      gyroscope: { x: 0, y: 0, z: 0 },
+      magnetometer: { x: 0, y: 0, z: 0 },
+      pedometer: { steps: 0 },
+      timestamp: Date.now()
     });
   }, []);
 
   return {
+    isInitializing,
     isTracking,
+    error,
     sensorData: {
       ...sensorData,
       pedometer: { steps: stepCount },
     },
     sensorsAvailable,
-    error,
-    start: startSensors,
+    start: initializeSensors,
     stop: stopTracking,
     reset,
   };

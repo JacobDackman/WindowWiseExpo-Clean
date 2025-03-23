@@ -1,12 +1,13 @@
-// First, import the polyfill (must be first)
+// First import the polyfill (must be first)
 import 'react-native-get-random-values';
 
-// Then import React and other dependencies (only once)
+// Then import React and other dependencies
 import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { reportCrash } from './src/utils/crashReporting';
 import { StyleSheet, View, Text, ActivityIndicator, ImageBackground, LogBox } from 'react-native';
 import * as SplashScreen from 'expo-splash-screen';
 import { Asset } from 'expo-asset';
@@ -17,13 +18,11 @@ import { HomeScreen } from './src/screens/HomeScreen';
 import { MappingScreen } from './src/screens/MappingScreen';
 import ErrorBoundary from './src/components/ErrorBoundary';
 
-// Rest of your code...
-
 // Ignore specific harmless warnings
 LogBox.ignoreLogs([
   'Asyncstorage has been extracted',
   'Require cycle:',
-  'Non-serializable values were found in the navigation state',
+  'Non-serializable values were found in the navigation state'
 ]);
 
 // Prevent the splash screen from auto-hiding
@@ -40,26 +39,23 @@ export default function App() {
 
   // Load assets and other resources
   useEffect(() => {
-    const prepare = async () => {
+    async function prepare() {
       try {
         // Pre-load assets
         const images = [
           require('./assets/icon.png'),
           require('./assets/splash.png'),
-          require('./assets/adaptive-icon.png'),
+          require('./assets/adaptive-icon.png')
         ];
+
+        // Cache images concurrently
+        const imagePromises = images.map(image => 
+          Asset.fromModule(image).downloadAsync()
+        );
         
-        // Cache images
-        const cacheImages = images.map(image => {
-          return Asset.fromModule(image).downloadAsync();
-        });
-        
-        // Wait for assets to load
-        await Promise.all(cacheImages);
-        
-        // Artificial small delay to ensure everything is ready
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
+        // Wait for all assets to load
+        await Promise.all(imagePromises);
+
         // Success - hide splash screen
         await SplashScreen.hideAsync();
       } catch (error) {
@@ -68,9 +64,10 @@ export default function App() {
         // Hide splash screen even on error, so we can show our own error UI
         SplashScreen.hideAsync().catch(console.error);
       } finally {
+        // Set app as ready
         setIsReady(true);
       }
-    };
+    }
 
     prepare();
   }, []);
@@ -111,7 +108,9 @@ export default function App() {
           >
             <NavigationContainer fallback={<Text>Loading navigation...</Text>}>
               <ErrorBoundary>
-                <Stack.Navigator 
+                <Stack.Navigator
+                  // Using any type assertion here to work around React Navigation v7 type issue
+                  {...({} as any)}
                   initialRouteName="Home"
                   screenOptions={{
                     headerShown: false,

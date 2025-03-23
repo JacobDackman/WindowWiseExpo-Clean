@@ -146,6 +146,29 @@ export const MappingScreen: React.FC = () => {
   const accelerometerSubscriptionRef = useRef<{ remove: () => void } | null>(null);
   const gyroscopeSubscriptionRef = useRef<{ remove: () => void } | null>(null);
 
+  // Function to clean up sensor subscriptions
+  const cleanupSubscriptions = useCallback(() => {
+    if (magnetometerSubscriptionRef.current) {
+      magnetometerSubscriptionRef.current.remove();
+      magnetometerSubscriptionRef.current = null;
+    }
+    
+    if (accelerometerSubscriptionRef.current) {
+      accelerometerSubscriptionRef.current.remove();
+      accelerometerSubscriptionRef.current = null;
+    }
+    
+    if (gyroscopeSubscriptionRef.current) {
+      gyroscopeSubscriptionRef.current.remove();
+      gyroscopeSubscriptionRef.current = null;
+    }
+
+    // Also use the stop function from the useSensors hook if available
+    if (stopSensors) {
+      stopSensors();
+    }
+  }, [stopSensors]);
+
   // Keep screen awake during mapping
   useKeepAwake();
 
@@ -289,43 +312,18 @@ export const MappingScreen: React.FC = () => {
   // Effect for initialization
   useEffect(() => {
     let mounted = true;
-    let initTimeout: NodeJS.Timeout;
 
     const initialize = async () => {
       try {
-        if (mounted) {
-          // Set a timeout for the entire initialization process
-          const initializationPromise = initializeSensors();
-          const timeoutPromise = new Promise<boolean>((_, reject) => {
-            initTimeout = setTimeout(() => {
-              reject(new Error('Sensor initialization timed out'));
-            }, 10000); // 10 second timeout
-          });
-
-          const success = await Promise.race([initializationPromise, timeoutPromise]);
-          
-          if (mounted) {
-            if (success) {
-              console.log('Sensor initialization successful');
-            } else {
-              console.log('Sensor initialization failed');
-              navigation.navigate('Home' as never);
-            }
-          }
+        const success = await initializeSensors();
+        if (!success && mounted) {
+          // Show some UI feedback that initialization failed
+          setError('Failed to initialize sensors');
         }
       } catch (error) {
+        console.error('[MappingScreen] Sensor initialization failed:', error);
         if (mounted) {
-          console.error('Failed to initialize sensors:', error);
-          Alert.alert(
-            'Sensor Error',
-            'Sensor initialization timed out. Please try again.',
-            [{ text: 'OK', onPress: () => navigation.navigate('Home' as never) }]
-          );
-        }
-      } finally {
-        if (mounted) {
-          clearTimeout(initTimeout);
-          setIsInitializing(false);
+          setError('Error initializing sensors');
         }
       }
     };
@@ -334,10 +332,9 @@ export const MappingScreen: React.FC = () => {
 
     return () => {
       mounted = false;
-      clearTimeout(initTimeout);
-      stopSensors();
+      cleanupSubscriptions();
     };
-  }, [initializeSensors, stopSensors, navigation]);
+  }, [initializeSensors, cleanupSubscriptions]);
 
   // Handle mapping data updates
   useEffect(() => {
@@ -779,6 +776,32 @@ export const MappingScreen: React.FC = () => {
     }
   }, [mappingState, currentProject]);
 
+  // Initialize sensors when component mounts
+  useEffect(() => {
+    initializeSensors();
+
+    // Cleanup when component unmounts
+    return () => {
+      cleanupSubscriptions();
+    };
+  }, []); // Empty dependency array means this only runs on mount/unmount
+
+  // Add a delay before initializing sensors after modal closes
+  const handleFloorCreated = async () => {
+    setFloorManagerVisible(false);
+    // Give time for the modal animation to complete
+    await new Promise(resolve => setTimeout(resolve, 500));
+    // Then initialize sensors
+    const success = await initializeSensors();
+    if (!success) {
+      Alert.alert(
+        'Sensor Error',
+        'Failed to initialize sensors. Please try again.',
+        [{ text: 'OK' }]
+      );
+    }
+  };
+
   if (isInitializing) {
     return (
       <SensorStatus
@@ -984,7 +1007,7 @@ export const MappingScreen: React.FC = () => {
         {/* Floor Manager Modal */}
         <FloorManager 
           visible={isFloorManagerVisible} 
-          onClose={() => setFloorManagerVisible(false)} 
+          onClose={handleFloorCreated} 
         />
         
         {/* Wall & Feature Editor Modal */}
