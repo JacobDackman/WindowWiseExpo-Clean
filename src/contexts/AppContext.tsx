@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useReducer, useEffect } from 'react';
+import React, { createContext, useContext, useReducer, useCallback, useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { captureRef } from 'react-native-view-shot';
 import { View } from 'react-native';
@@ -19,6 +19,7 @@ import {
   SensorData,
 } from '../types';
 import { ENV } from '../config/env';
+import { storage } from '../utils/storage';
 
 // Default settings
 const defaultSettings: AppSettings = {

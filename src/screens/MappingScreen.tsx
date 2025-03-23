@@ -15,6 +15,7 @@ import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import * as MediaLibrary from 'expo-media-library';
+import NetInfo from '@react-native-community/netinfo';
 import { 
   Magnetometer, 
   Accelerometer, 
@@ -35,6 +36,13 @@ import { WallEditor } from '../components/WallEditor';
 import { MapExporter } from '../components/MapExporter';
 import { FeatureType, Point } from '../types';
 import { ENV } from '../config/env';
+import { useAppState } from '../hooks/useAppState';
+import { useKeepAwake } from 'expo-keep-awake';
+import { SensorStatus } from '../components/SensorStatus';
+import { MappingControls } from '../components/MappingControls';
+import { storage } from '../utils/storage';
+import { calculateDistance, calculatePosition } from '../utils/distance';
+import { colors } from '../theme';
 
 // Define sensor subscription types
 type SensorInitStatus = {
@@ -65,11 +73,31 @@ type SensorSubscriptionType = {
   [key: string]: any;
 };
 
+interface MappingData {
+  timestamp: number;
+  position: { x: number; y: number };
+  sensors: {
+    accelerometer: { x: number; y: number; z: number };
+    magnetometer: { x: number; y: number; z: number };
+  };
+}
+
 export const MappingScreen: React.FC = () => {
   const navigation = useNavigation();
   const { state, dispatch, startMapping, pauseMapping, stopMapping, addFeature, saveProject } = useApp();
   const { currentProject, mappingState, settings } = state;
-  const { isTracking, sensorData, sensorsAvailable, error: sensorError } = useSensors();
+  const {
+    isTracking: sensorTracking,
+    sensorData,
+    sensorsAvailable,
+    error: sensorError,
+    start: startSensors,
+    stop: stopSensors,
+    reset: resetSensors,
+  } = useSensors({
+    enabled: true,
+    updateInterval: ENV.SENSOR_UPDATE_INTERVAL,
+  });
   const [calibrationCountdown, setCalibrationCountdown] = useState(3);
   const [mappingProcessor] = useState(() => new MappingProcessor(settings));
   const [isFloorManagerVisible, setFloorManagerVisible] = useState(false);
@@ -85,7 +113,14 @@ export const MappingScreen: React.FC = () => {
   });
   
   // Sensor initialization state
-  const [isSensorInitializing, setIsSensorInitializing] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [isMappingActive, setIsMappingActive] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [distance, setDistance] = useState(0);
+  const [lastSaveTime, setLastSaveTime] = useState(Date.now());
+  const [retryAttempts, setRetryAttempts] = useState(0);
+  const [isTracking, setIsTracking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [sensorInitStatus, setSensorInitStatus] = useState<SensorInitStatus>({
     accelerometer: false,
     magnetometer: false,
@@ -111,101 +146,45 @@ export const MappingScreen: React.FC = () => {
   const accelerometerSubscriptionRef = useRef<{ remove: () => void } | null>(null);
   const gyroscopeSubscriptionRef = useRef<{ remove: () => void } | null>(null);
 
-  // Initialize sensors and check if they're working
-  const initializeSensors = async () => {
-    return new Promise<boolean>(async (resolve, reject) => {
-      try {
-        // Initialize all sensors in parallel
-        const [accelerometerAvailable, magnetometerAvailable] = await Promise.all([
-          Accelerometer.isAvailableAsync(),
-          Magnetometer.isAvailableAsync(),
-        ]);
+  // Keep screen awake during mapping
+  useKeepAwake();
 
-        // Set up sensor subscriptions with proper types
-        if (accelerometerAvailable) {
-          try {
-            await Accelerometer.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL);
-            accelerometerSubscriptionRef.current = Accelerometer.addListener(
-              (accelerometerData: ThreeAxisMeasurement) => {
-                setSensorInitStatus(prev => ({ ...prev, accelerometer: true }));
-              }
-            );
-          } catch (error) {
-            console.error('Error setting up accelerometer:', error);
-          }
-        }
-
-        if (magnetometerAvailable) {
-          try {
-            await Magnetometer.setUpdateInterval(ENV.SENSOR_UPDATE_INTERVAL);
-            magnetometerSubscriptionRef.current = Magnetometer.addListener(
-              (magnetometerData: ThreeAxisMeasurement) => {
-                setSensorInitStatus(prev => ({ ...prev, magnetometer: true }));
-              }
-            );
-          } catch (error) {
-            console.error('Error setting up magnetometer:', error);
-          }
-        }
-
-        // Update sensor status atomically
-        setSensorInitStatus({
-          accelerometer: accelerometerAvailable,
-          magnetometer: magnetometerAvailable,
-          pedometer: accelerometerAvailable, // Use accelerometer for step detection
-        });
-
-        // Check if all sensors are available
-        if (accelerometerAvailable && magnetometerAvailable) {
-          resolve(true);
-        } else {
-          const unavailableSensors: string[] = [];
-          if (!accelerometerAvailable) unavailableSensors.push('Accelerometer');
-          if (!magnetometerAvailable) unavailableSensors.push('Magnetometer');
-          
-          Alert.alert(
-            'Sensor Unavailable',
-            `The following sensors are not available: ${unavailableSensors.join(', ')}. The app may not function correctly.`
-          );
-          resolve(false);
-        }
-      } catch (error) {
-        console.error('Error initializing sensors:', error);
-        Alert.alert('Error', 'Failed to initialize sensors. Please restart the app.');
-        reject(error);
+  // Handle app state changes
+  useAppState({
+    onBackground: () => {
+      if (mappingState === 'mapping' && !sensorTracking) {
+        handlePauseMapping();
       }
-    });
-  };
-  
-  // Lock screen to portrait mode
-  useEffect(() => {
-    const lockOrientation = async () => {
-      try {
-        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
-      } catch (error) {
-        console.warn('Failed to lock orientation:', error);
-      }
-    };
-    
-    lockOrientation();
-    return () => {
-      ScreenOrientation.unlockAsync().catch(console.warn);
-    };
-  }, []);
+    },
+    onForeground: () => {
+      // Optionally resume mapping when app comes to foreground
+      // This depends on your app's requirements
+    },
+  });
+
+  // Refs for tracking
+  const mappingDataRef = useRef<MappingData[]>([]);
+  const lastPositionRef = useRef<{ x: number; y: number } | null>(null);
 
   // Process sensor data when tracking
   useEffect(() => {
     // Check sensor initialization status when initializing
-    if (isSensorInitializing && sensorData) {
+    if (isInitializing && sensorData) {
       const newStatus = {...sensorInitStatus};
       
       // Check if we've received valid accelerometer data
-      if (sensorData.accelerometer) {
+      if (sensorData.accelerometer && 
+          typeof sensorData.accelerometer.x === 'number' &&
+          typeof sensorData.accelerometer.y === 'number' &&
+          typeof sensorData.accelerometer.z === 'number') {
         newStatus.accelerometer = true;
       }
       
       // Check if we've received valid magnetometer data
-      if (sensorData.magnetometer) {
+      if (sensorData.magnetometer && 
+          typeof sensorData.magnetometer.x === 'number' &&
+          typeof sensorData.magnetometer.y === 'number' &&
+          typeof sensorData.magnetometer.z === 'number') {
         newStatus.magnetometer = true;
       }
       
@@ -215,6 +194,11 @@ export const MappingScreen: React.FC = () => {
       }
       
       setSensorInitStatus(newStatus);
+
+      // If all sensors are initialized, we can proceed
+      if (newStatus.accelerometer && newStatus.magnetometer && newStatus.pedometer) {
+        setIsInitializing(false);
+      }
     }
   
     // Original code for mapping
@@ -239,66 +223,174 @@ export const MappingScreen: React.FC = () => {
         handleStopMapping();
       }
     }
-  }, [mappingState, sensorData]);
+  }, [mappingState, sensorData, isInitializing]);
 
-  // Stop tracking function
-  const stopTracking = useCallback(() => {
-    if (isTracking) {
-      // Stop tracking in the app context
-      stopMapping();
+  // Initialize sensors with configuration
+  const initializeSensors = useCallback(async (): Promise<boolean> => {
+    try {
+      setIsInitializing(true);
+      setError(null);
+      setSensorInitStatus({
+        accelerometer: false,
+        magnetometer: false,
+        pedometer: false,
+      });
+
+      // First check if sensors are available
+      const [accelerometerAvailable, magnetometerAvailable] = await Promise.all([
+        Accelerometer.isAvailableAsync(),
+        Magnetometer.isAvailableAsync(),
+      ]);
+
+      console.log('Checking sensor availability:', {
+        accelerometer: accelerometerAvailable,
+        magnetometer: magnetometerAvailable,
+      });
+
+      if (!accelerometerAvailable || !magnetometerAvailable) {
+        const missingSensors = [];
+        if (!accelerometerAvailable) missingSensors.push('accelerometer');
+        if (!magnetometerAvailable) missingSensors.push('magnetometer');
+        
+        Alert.alert(
+          'Sensor Error',
+          `Required sensors are not available: ${missingSensors.join(', ')}. Please check your device settings.`,
+          [{ text: 'OK', onPress: () => navigation.navigate('Home' as never) }]
+        );
+        setIsInitializing(false);
+        return false;
+      }
+
+      // Then try to initialize sensors
+      const success = await startSensors();
       
-      // Additional cleanup if needed
-      if (magnetometerSubscriptionRef.current) {
-        magnetometerSubscriptionRef.current.remove();
-        magnetometerSubscriptionRef.current = null;
+      if (!success) {
+        Alert.alert(
+          'Sensor Error',
+          'Failed to initialize sensors. Please check your device settings and try again.',
+          [{ text: 'OK', onPress: () => navigation.navigate('Home' as never) }]
+        );
+        setIsInitializing(false);
+        return false;
       }
-      if (accelerometerSubscriptionRef.current) {
-        accelerometerSubscriptionRef.current.remove();
-        accelerometerSubscriptionRef.current = null;
-      }
-      if (gyroscopeSubscriptionRef.current) {
-        gyroscopeSubscriptionRef.current.remove();
-        gyroscopeSubscriptionRef.current = null;
-      }
+
+      return true;
+    } catch (error) {
+      console.error('Sensor initialization error:', error);
+      Alert.alert(
+        'Sensor Error',
+        error instanceof Error ? error.message : 'Failed to initialize sensors',
+        [{ text: 'OK', onPress: () => navigation.navigate('Home' as never) }]
+      );
+      return false;
     }
-  }, [isTracking, stopMapping]);
-  
-  // Cleanup useEffect
+  }, [startSensors, navigation]);
+
+  // Effect for initialization
   useEffect(() => {
-    return () => {
-      // Clear any existing intervals
-      if (sensorCheckIntervalRef.current) {
-        clearInterval(sensorCheckIntervalRef.current);
-      }
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-      
-      // Stop sensor tracking if active
-      if (isTracking) {
-        stopTracking();
+    let mounted = true;
+    let initTimeout: NodeJS.Timeout;
+
+    const initialize = async () => {
+      try {
+        if (mounted) {
+          // Set a timeout for the entire initialization process
+          const initializationPromise = initializeSensors();
+          const timeoutPromise = new Promise<boolean>((_, reject) => {
+            initTimeout = setTimeout(() => {
+              reject(new Error('Sensor initialization timed out'));
+            }, 10000); // 10 second timeout
+          });
+
+          const success = await Promise.race([initializationPromise, timeoutPromise]);
+          
+          if (mounted) {
+            if (success) {
+              console.log('Sensor initialization successful');
+            } else {
+              console.log('Sensor initialization failed');
+              navigation.navigate('Home' as never);
+            }
+          }
+        }
+      } catch (error) {
+        if (mounted) {
+          console.error('Failed to initialize sensors:', error);
+          Alert.alert(
+            'Sensor Error',
+            'Sensor initialization timed out. Please try again.',
+            [{ text: 'OK', onPress: () => navigation.navigate('Home' as never) }]
+          );
+        }
+      } finally {
+        if (mounted) {
+          clearTimeout(initTimeout);
+          setIsInitializing(false);
+        }
       }
     };
-  }, [isTracking, stopTracking]);
 
-  // Check if a project is selected and handle initialization
+    initialize();
+
+    return () => {
+      mounted = false;
+      clearTimeout(initTimeout);
+      stopSensors();
+    };
+  }, [initializeSensors, stopSensors, navigation]);
+
+  // Handle mapping data updates
   useEffect(() => {
-    if (!currentProject) {
-      // If no project, go back to home screen
-      navigation.navigate('Home' as never);
-      return;
-    } 
-    
-    // If there are no floors, show the floor manager modal
-    if (currentProject.floors.length === 0) {
-      console.log('No floors found, showing floor manager');
-      setTimeout(() => {
-        setFloorManagerVisible(true);
-      }, 500); // Short delay to ensure component is fully mounted
-    }
-  }, [currentProject, navigation]);
+    if (!sensorTracking) return;
 
-  // Start mapping
+    const { accelerometer, magnetometer, timestamp } = sensorData;
+    if (!accelerometer || !magnetometer) return;
+
+    // Calculate position and update distance
+    const newPosition = calculatePosition(accelerometer, magnetometer);
+    if (lastPositionRef.current) {
+      const newDistance = calculateDistance(lastPositionRef.current, newPosition);
+      setDistance(prev => prev + newDistance);
+    }
+    lastPositionRef.current = newPosition;
+
+    // Store mapping data
+    mappingDataRef.current.push({
+      timestamp,
+      position: newPosition,
+      sensors: {
+        accelerometer,
+        magnetometer,
+      },
+    });
+
+    // Auto-save data periodically
+    const now = Date.now();
+    if (now - lastSaveTime >= ENV.AUTO_SAVE_INTERVAL) {
+      handleAutoSave();
+    }
+  }, [sensorData, sensorTracking]);
+
+  // Handle auto-save
+  const handleAutoSave = useCallback(async () => {
+    try {
+      await storage.saveMappingData(
+        currentProject.id,
+        currentProject.currentFloorId,
+        mappingDataRef.current
+      );
+      setLastSaveTime(Date.now());
+    } catch (error) {
+      console.error('Auto-save error:', error);
+      Alert.alert(
+        'Save Error',
+        'Failed to auto-save mapping data. Please manually save your progress.',
+        [{ text: 'OK' }]
+      );
+    }
+  }, [currentProject]);
+
+  // Start mapping with sensor checks
   const handleStartMapping = () => {
     if (!currentProject || !currentProject.currentFloorId) {
       Alert.alert('Error', 'Please create a floor first');
@@ -327,10 +419,13 @@ export const MappingScreen: React.FC = () => {
     setCurrentPoints([]);
     
     // Initialize sensors first
-    initializeSensors().then(async (success) => {
+    initializeSensors().then((success) => {
       if (success) {
         startMapping();
       }
+    }).catch((error) => {
+      console.error('Failed to initialize sensors:', error);
+      Alert.alert('Error', 'Failed to initialize sensors. Please try again.');
     });
   };
 
@@ -345,31 +440,53 @@ export const MappingScreen: React.FC = () => {
   };
 
   // Stop mapping and save the wall
-  const handleStopMapping = () => {
+  const handleStopMapping = async () => {
     stopMapping();
     
     if (currentProject && currentProject.currentFloorId && pointsRef.current.length > 2) {
-      // Get simplified and closed points
       const finalPoints = mappingProcessor.closeLoop();
       
-      // Add the wall to the current floor
-      dispatch({
-        type: 'ADD_WALL',
-        payload: {
-          floorId: currentProject.currentFloorId,
-          points: finalPoints,
-        },
-      });
-      
-      // Save the project
-      saveProject();
-      
-      // Show success message
-      Alert.alert(
-        'Wall Mapped',
-        'The wall has been added to the current floor.',
-        [{ text: 'OK' }]
-      );
+      try {
+        // Add the wall to the current floor
+        dispatch({
+          type: 'ADD_WALL',
+          payload: {
+            floorId: currentProject.currentFloorId,
+            points: finalPoints,
+          },
+        });
+        
+        // Save project with offline support
+        await storage.saveProject({
+          ...currentProject,
+          lastModified: Date.now(),
+          syncStatus: isOffline ? 'pending' : 'synced'
+        });
+
+        // Save mapping data
+        if (mappingDataRef.current.length > 0) {
+          await storage.saveMappingData(
+            currentProject.id,
+            currentProject.currentFloorId,
+            mappingDataRef.current
+          );
+        }
+        
+        Alert.alert(
+          'Wall Mapped',
+          isOffline ? 
+            'The wall has been saved locally and will sync when online.' :
+            'The wall has been added to the current floor.',
+          [{ text: 'OK' }]
+        );
+      } catch (error) {
+        console.error('Error saving wall:', error);
+        Alert.alert(
+          'Save Error',
+          'Failed to save the wall. Please try again.',
+          [{ text: 'OK' }]
+        );
+      }
     } else if (pointsRef.current.length <= 2) {
       Alert.alert(
         'Not Enough Points',
@@ -378,184 +495,166 @@ export const MappingScreen: React.FC = () => {
       );
     }
   };
-  // Add a feature to the current wall
-  const handleAddFeature = (featureType: FeatureType) => {
-    if (mappingState !== 'completed') {
-      Alert.alert('Not Available', 'You can add features after completing the wall mapping.');
-      return;
-    }
-    
-    // Check if there's a current project, floor, and at least one wall
-    if (!currentProject || !currentProject.currentFloorId) {
-      Alert.alert('Error', 'No active project or floor selected.');
-      return;
-    }
-    
-    const floor = currentProject.floors.find(f => f.id === currentProject.currentFloorId);
-    if (!floor || floor.walls.length === 0) {
-      Alert.alert('Error', 'Please create a wall first.');
-      return;
-    }
-    
-    // Get current feature count
-    const typeCount = state.featureCounts[featureType];
-    const nextCount = typeCount + 1;
-    
-    // Create the label based on feature type
-    const labelPrefix = featureType === 'window' ? 'W' : 
-                        featureType === 'door' ? 'D' : 'SGD';
-    
-    // Show feature placement instructions with label
-    Alert.alert(
-      `Add ${labelPrefix}${nextCount}`,
-      `Placing a new ${featureType === 'sliding-door' ? 'sliding door' : featureType} labeled as ${labelPrefix}${nextCount}`,
-      [
-        { 
-          text: 'Cancel',
-          style: 'cancel'
-        },
-        {
-          text: 'Place at Center',
-          onPress: () => {
-            // For simplicity, add feature at normalized position 0.5 (middle of the wall)
-            // with a default width
-            const defaultWidth = 1.0; // 1 meter
-            addFeature(featureType, 0.5, defaultWidth);
-          }
-        }
-      ]
-    );
-  };
 
-// Calibrate the compass
-// Improved compass calibration
-const handleCalibrate = () => {
-  // Check if magnetometer is available
-  if (!sensorsAvailable.magnetometer) {
-    Alert.alert(
-      'Sensor Unavailable',
-      'Compass (magnetometer) is not available on this device.',
-      [{ text: 'OK' }]
-    );
-    return;
-  }
-  
-  // Set calibrating state to show the overlay
-  setIsCalibrating(true);
-  setCalibrationCountdown(3);
-  
-  // Store multiple readings for better accuracy
-  const readings: number[] = [];
-  
-  // Create countdown interval
-  const countdownInterval = setInterval(() => {
-    setCalibrationCountdown(prev => {
-      if (prev <= 1) {
-        clearInterval(countdownInterval);
-        return 0;
-      }
-      return prev - 1;
-    });
-  }, 1000);
-  
-  // Use the current magnetometer readings for calibration
-  const collectReadings = () => {
-    if (sensorData?.magnetometer) {
-      // Calculate heading from magnetometer data
-      const heading = Math.atan2(
-        sensorData.magnetometer.y,
-        sensorData.magnetometer.x
-      ) * (180 / Math.PI);
-      
-      // Normalize heading to 0-360 range
-      const normalizedHeading = (heading + 360) % 360;
-      
-      // Add to readings array
-      readings.push(normalizedHeading);
-      
-      // Keep only the last 10 readings
-      if (readings.length > 10) {
-        readings.shift();
-      }
-    }
-  };
-  
-  // Collect readings every 100ms
-  const readingInterval = setInterval(collectReadings, 100);
-  
-  // Use the average of multiple readings for calibration after 3 seconds
-  timerRef.current = setTimeout(() => {
-    // Clean up
-    clearInterval(countdownInterval);
-    clearInterval(readingInterval);
-    
-    // Check if we have enough readings
-    if (readings.length >= 5) {
+  // Lock screen to portrait mode
+  useEffect(() => {
+    const lockOrientation = async () => {
       try {
-        // Calculate average heading (excluding outliers)
-        readings.sort((a, b) => a - b);
-        // Remove potential outliers (first and last reading)
-        const filteredReadings = readings.length > 2 ? readings.slice(1, -1) : readings;
-        const sum = filteredReadings.reduce((acc, val) => acc + val, 0);
-        const avgHeading = sum / filteredReadings.length;
+        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+      } catch (error) {
+        console.warn('Failed to lock orientation:', error);
+      }
+    };
+    
+    lockOrientation();
+    return () => {
+      ScreenOrientation.unlockAsync().catch(console.warn);
+    };
+  }, []);
+
+  // Check if a project is selected and handle initialization
+  useEffect(() => {
+    if (!currentProject) {
+      // If no project, go back to home screen
+      navigation.navigate('Home' as never);
+      return;
+    } 
+    
+    // If there are no floors, show the floor manager modal
+    if (currentProject.floors.length === 0 && !isFloorManagerVisible) {
+      setFloorManagerVisible(true);
+    }
+  }, [currentProject, navigation, isFloorManagerVisible]);
+
+  // Calibrate the compass
+  // Improved compass calibration
+  const handleCalibrate = () => {
+    // Check if magnetometer is available
+    if (!sensorsAvailable.magnetometer) {
+      Alert.alert(
+        'Sensor Unavailable',
+        'Compass (magnetometer) is not available on this device.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+    
+    // Set calibrating state to show the overlay
+    setIsCalibrating(true);
+    setCalibrationCountdown(3);
+    
+    // Store multiple readings for better accuracy
+    const readings: number[] = [];
+    
+    // Create countdown interval
+    const countdownInterval = setInterval(() => {
+      setCalibrationCountdown(prev => {
+        if (prev <= 1) {
+          clearInterval(countdownInterval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    
+    // Use the current magnetometer readings for calibration
+    const collectReadings = () => {
+      if (sensorData?.magnetometer) {
+        // Calculate heading from magnetometer data
+        const heading = Math.atan2(
+          sensorData.magnetometer.y,
+          sensorData.magnetometer.x
+        ) * (180 / Math.PI);
         
-        // Apply calibration to the mapping processor
-        mappingProcessor.calibrate(avgHeading);
+        // Normalize heading to 0-360 range
+        const normalizedHeading = (heading + 360) % 360;
         
+        // Add to readings array
+        readings.push(normalizedHeading);
+        
+        // Keep only the last 10 readings
+        if (readings.length > 10) {
+          readings.shift();
+        }
+      }
+    };
+    
+    // Collect readings every 100ms
+    const readingInterval = setInterval(collectReadings, 100);
+    
+    // Use the average of multiple readings for calibration after 3 seconds
+    timerRef.current = setTimeout(() => {
+      // Clean up
+      clearInterval(countdownInterval);
+      clearInterval(readingInterval);
+      
+      // Check if we have enough readings
+      if (readings.length >= 5) {
+        try {
+          // Calculate average heading (excluding outliers)
+          readings.sort((a, b) => a - b);
+          // Remove potential outliers (first and last reading)
+          const filteredReadings = readings.length > 2 ? readings.slice(1, -1) : readings;
+          const sum = filteredReadings.reduce((acc, val) => acc + val, 0);
+          const avgHeading = sum / filteredReadings.length;
+          
+          // Apply calibration to the mapping processor
+          mappingProcessor.calibrate(avgHeading);
+          
+          // Hide the calibration overlay
+          setIsCalibrating(false);
+          
+          // Show success message with the calibrated heading
+          Alert.alert(
+            'Calibration Complete', 
+            `Compass has been calibrated to ${Math.round(avgHeading)}° from magnetic North.`,
+            [{ text: 'OK' }]
+          );
+        } catch (error) {
+          console.error('Calibration error:', error);
+          setIsCalibrating(false);
+          Alert.alert(
+            'Calibration Error',
+            'An error occurred during calibration. Please try again.',
+            [{ text: 'OK' }]
+          );
+        }
+      } else {
         // Hide the calibration overlay
         setIsCalibrating(false);
         
-        // Show success message with the calibrated heading
+        // Show error message
         Alert.alert(
-          'Calibration Complete', 
-          `Compass has been calibrated to ${Math.round(avgHeading)}° from magnetic North.`,
-          [{ text: 'OK' }]
-        );
-      } catch (error) {
-        console.error('Calibration error:', error);
-        setIsCalibrating(false);
-        Alert.alert(
-          'Calibration Error',
-          'An error occurred during calibration. Please try again.',
-          [{ text: 'OK' }]
+          'Calibration Failed',
+          'Could not get reliable compass readings. Please try again in an open area away from electronic devices and metal objects.',
+          [{ text: 'Try Again', onPress: handleCalibrate },
+           { text: 'OK' }]
         );
       }
-    } else {
-      // Hide the calibration overlay
-      setIsCalibrating(false);
       
-      // Show error message
-      Alert.alert(
-        'Calibration Failed',
-        'Could not get reliable compass readings. Please try again in an open area away from electronic devices and metal objects.',
-        [{ text: 'Try Again', onPress: handleCalibrate },
-         { text: 'OK' }]
-      );
-    }
-    
-    // Reset the timer reference
-    timerRef.current = null;
-  }, 3000);
-};
+      // Reset the timer reference
+      timerRef.current = null;
+    }, 3000);
+  };
 
-// Function to handle cancellation
-const cancelCalibration = () => {
-  if (timerRef.current) {
-    clearTimeout(timerRef.current);
-    timerRef.current = null;
-  }
-  
-  setIsCalibrating(false);
-};
-
-// Make sure to clean up the timer in useEffect
-useEffect(() => {
-  return () => {
+  // Function to handle cancellation
+  const cancelCalibration = () => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
+      timerRef.current = null;
     }
+    
+    setIsCalibrating(false);
   };
-}, []);
+
+  // Make sure to clean up the timer in useEffect
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+      }
+    };
+  }, []);
 
   // Open the map exporter
   const handleExport = () => {
@@ -591,6 +690,105 @@ useEffect(() => {
       }).start();
     }
   }, [mappingState, sensorReadings.isMoving, mappingFeedbackOpacity]);
+
+  // Add a feature to the current wall
+  const handleAddFeature = (featureType: FeatureType) => {
+    if (mappingState !== 'completed') {
+      Alert.alert('Not Available', 'You can add features after completing the wall mapping.');
+      return;
+    }
+    
+    // Check if there's a current project, floor, and at least one wall
+    if (!currentProject || !currentProject.currentFloorId) {
+      Alert.alert('Error', 'No active project or floor selected.');
+      return;
+    }
+    
+    const floor = currentProject.floors.find(f => f.id === currentProject.currentFloorId);
+    if (!floor || floor.walls.length === 0) {
+      Alert.alert('Error', 'Please create a wall first.');
+      return;
+    }
+    
+    // Get current feature count
+    const typeCount = state.featureCounts[featureType];
+    const nextCount = typeCount + 1;
+    
+    // Create the label based on feature type
+    const labelPrefix = featureType === 'window' ? 'W' : 
+                       featureType === 'door' ? 'D' : 'SGD';
+    
+    // Show feature placement instructions with label
+    Alert.alert(
+      `Add ${labelPrefix}${nextCount}`,
+      `Placing a new ${featureType === 'sliding-door' ? 'sliding door' : featureType} labeled as ${labelPrefix}${nextCount}`,
+      [
+        { 
+          text: 'Cancel',
+          style: 'cancel'
+        },
+        {
+          text: 'Place at Center',
+          onPress: () => {
+            // For simplicity, add feature at normalized position 0.5 (middle of the wall)
+            // with a default width
+            const defaultWidth = 1.0; // 1 meter
+            addFeature(featureType, 0.5, defaultWidth);
+          }
+        }
+      ]
+    );
+  };
+
+  const [isOffline, setIsOffline] = useState(false);
+  const [lastAutoSave, setLastAutoSave] = useState<number>(Date.now());
+  const autoSaveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Check network status
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsOffline(!state.isConnected);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Auto-save functionality
+  useEffect(() => {
+    if (mappingState === 'mapping' && currentProject?.currentFloorId) {
+      autoSaveIntervalRef.current = setInterval(async () => {
+        try {
+          if (mappingDataRef.current.length > 0) {
+            await storage.saveMappingData(
+              currentProject.id,
+              currentProject.currentFloorId,
+              mappingDataRef.current
+            );
+            setLastAutoSave(Date.now());
+          }
+        } catch (error) {
+          console.error('Auto-save error:', error);
+        }
+      }, ENV.AUTO_SAVE_INTERVAL);
+
+      return () => {
+        if (autoSaveIntervalRef.current) {
+          clearInterval(autoSaveIntervalRef.current);
+        }
+      };
+    }
+  }, [mappingState, currentProject]);
+
+  if (isInitializing) {
+    return (
+      <SensorStatus
+        isInitializing={isInitializing}
+        sensorData={sensorData}
+        retryAttempts={retryAttempts}
+        error={error}
+      />
+    );
+  }
 
   return (
     <ImageBackground 
@@ -656,6 +854,16 @@ useEffect(() => {
               </>
             )}
           </View>
+
+          {/* Offline Status Banner */}
+          {isOffline && (
+            <View style={styles.offlineBanner}>
+              <Ionicons name="cloud-offline-outline" size={20} color="#FFA000" />
+              <Text style={styles.offlineText}>
+                Working offline - Changes will sync when connected
+              </Text>
+            </View>
+          )}
 
           {/* Control Panel */}
           <View style={styles.controlPanel}>
@@ -792,65 +1000,62 @@ useEffect(() => {
         />
         
         {/* Sensor Initialization Overlay */}
-      {/* Sensor Initialization Overlay */}
-{/* Sensor Initialization Overlay */}
-{isSensorInitializing && (
-  <View style={styles.sensorInitOverlay}>
-    <ActivityIndicator size="large" color="#2196F3" />
-    <Text style={styles.sensorInitText}>Initializing Sensors...</Text>
-    <View style={styles.sensorInitContainer}>
-      <View style={styles.sensorInitRow}>
-        <Text style={styles.sensorInitLabel}>Accelerometer:</Text>
-        <View style={[
-          styles.sensorInitIndicator, 
-          {backgroundColor: sensorInitStatus.accelerometer ? '#4CAF50' : '#9E9E9E'}
-        ]} />
-      </View>
-      
-      <View style={styles.sensorInitRow}>
-        <Text style={styles.sensorInitLabel}>Compass:</Text>
-        <View style={[
-          styles.sensorInitIndicator, 
-          {backgroundColor: sensorInitStatus.magnetometer ? '#4CAF50' : '#9E9E9E'}
-        ]} />
-      </View>
-      
-      <View style={styles.sensorInitRow}>
-        <Text style={styles.sensorInitLabel}>Step Detection:</Text>
-        <View style={[
-          styles.sensorInitIndicator, 
-          {backgroundColor: sensorInitStatus.pedometer ? '#4CAF50' : '#9E9E9E'}
-        ]} />
-      </View>
-    </View>
-  </View>
-)}
+        {isInitializing && (
+          <View style={styles.sensorInitOverlay}>
+            <ActivityIndicator size="large" color="#2196F3" />
+            <Text style={styles.sensorInitText}>Initializing Sensors...</Text>
+            <View style={styles.sensorInitContainer}>
+              <View style={styles.sensorInitRow}>
+                <Text style={styles.sensorInitLabel}>Accelerometer:</Text>
+                <View style={[
+                  styles.sensorInitIndicator, 
+                  {backgroundColor: sensorInitStatus.accelerometer ? '#4CAF50' : '#9E9E9E'}
+                ]} />
+              </View>
+              
+              <View style={styles.sensorInitRow}>
+                <Text style={styles.sensorInitLabel}>Compass:</Text>
+                <View style={[
+                  styles.sensorInitIndicator, 
+                  {backgroundColor: sensorInitStatus.magnetometer ? '#4CAF50' : '#9E9E9E'}
+                ]} />
+              </View>
+              
+              <View style={styles.sensorInitRow}>
+                <Text style={styles.sensorInitLabel}>Step Detection:</Text>
+                <View style={[
+                  styles.sensorInitIndicator, 
+                  {backgroundColor: sensorInitStatus.pedometer ? '#4CAF50' : '#9E9E9E'}
+                ]} />
+              </View>
+            </View>
+          </View>
+        )}
 
-{/* Compass Calibration Overlay */}
-{isCalibrating && (
-  <View style={styles.calibrationOverlay}>
-    <View style={styles.calibrationContainer}>
-      <ActivityIndicator size="large" color="#2196F3" />
-      <Text style={styles.calibrationText}>
-        Calibrating Compass... ({calibrationCountdown})
-      </Text>
-      <Text style={styles.calibrationInstructions}>
-        Point your device to North and hold steady.{'\n\n'}
-        For best results:{'\n'}
-        • Move away from electronic devices{'\n'}
-        • Stay away from metal objects{'\n'}
-        • Hold your phone flat and level
-      </Text>
-      <TouchableOpacity 
-        style={styles.cancelButton} 
-        onPress={cancelCalibration}
-      >
-        <Text style={styles.cancelButtonText}>Cancel</Text>
-      </TouchableOpacity>
-    </View>
-  </View>
-)}
-      
+        {/* Compass Calibration Overlay */}
+        {isCalibrating && (
+          <View style={styles.calibrationOverlay}>
+            <View style={styles.calibrationContainer}>
+              <ActivityIndicator size="large" color="#2196F3" />
+              <Text style={styles.calibrationText}>
+                Calibrating Compass... ({calibrationCountdown})
+              </Text>
+              <Text style={styles.calibrationInstructions}>
+                Point your device to North and hold steady.{'\n\n'}
+                For best results:{'\n'}
+                • Move away from electronic devices{'\n'}
+                • Stay away from metal objects{'\n'}
+                • Hold your phone flat and level
+              </Text>
+              <TouchableOpacity 
+                style={styles.cancelButton} 
+                onPress={cancelCalibration}
+              >
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
       </SafeAreaView>
     </ImageBackground>
   );
@@ -872,8 +1077,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     padding: 16,
     backgroundColor: 'rgba(33, 150, 243, 0.9)',
-    borderBottomLeftRadius: 20,
-    borderBottomRightRadius: 20,
+    borderBottomLeftRadius: Platform.select({ ios: 20, android: 0 }),
+    borderBottomRightRadius: Platform.select({ ios: 20, android: 0 }),
     marginBottom: 10,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
@@ -1150,5 +1355,26 @@ const styles = StyleSheet.create({
     color: 'white',
     fontWeight: 'bold',
     textAlign: 'center',
+  },
+  statusText: {
+    marginTop: 10,
+    color: colors.text,
+    fontSize: 16,
+  },
+  offlineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 152, 0, 0.1)',
+    padding: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 152, 0, 0.3)',
+    marginBottom: 8,
+  },
+  offlineText: {
+    color: '#333',
+    fontSize: 14,
+    marginLeft: 8,
+    flex: 1,
   },
 });
