@@ -166,7 +166,7 @@ export function useSensors(options?: SensorOptions): SensorHookResult {
 
   // Subscription refs
   const subscriptionsRef = useRef<SensorSubscriptions>({});
-  const initTimeoutRef = useRef<NodeJS.Timeout>();
+  const initTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Cleanup subscriptions
   const cleanupSubscriptions = useCallback(() => {
@@ -264,18 +264,24 @@ export function useSensors(options?: SensorOptions): SensorHookResult {
         cleanupSubscriptions();
       }
 
+      // Clear any existing timeout
+      if (initTimeoutRef.current) {
+        clearTimeout(initTimeoutRef.current);
+        initTimeoutRef.current = null;
+      }
+
       setIsInitializing(true);
       setError(null);
 
-      // Add initialization timeout
-      const initializationTimeout = new Promise<boolean>((_, reject) => {
-        setTimeout(() => {
+      // Create a timeout promise that will reject after the specified time
+      const initializationTimeoutPromise = new Promise<boolean>((_, reject) => {
+        initTimeoutRef.current = setTimeout(() => {
           reject(new Error('Sensor initialization timeout'));
         }, STEP_DETECTION_CONFIG.INITIALIZATION_TIMEOUT);
       });
 
-      // Race between initialization and timeout
-      const initializeWithTimeout = async (): Promise<boolean> => {
+      // The actual initialization logic
+      const initializeSensorsPromise = async (): Promise<boolean> => {
         const androidSetup = await setupAndroidSensors();
         if (!androidSetup) {
           throw new Error('Android sensor setup failed');
@@ -361,10 +367,26 @@ export function useSensors(options?: SensorOptions): SensorHookResult {
         return true;
       };
 
-      await Promise.race([initializeWithTimeout(), initializationTimeout]);
-      setIsTracking(true);
-      setIsInitializing(false);
-      return true;
+      try {
+        await Promise.race([initializeSensorsPromise(), initializationTimeoutPromise]);
+        
+        // If we got here, initialization succeeded, so clear the timeout
+        if (initTimeoutRef.current) {
+          clearTimeout(initTimeoutRef.current);
+          initTimeoutRef.current = null;
+        }
+        
+        setIsTracking(true);
+        setIsInitializing(false);
+        return true;
+      } catch (error) {
+        // Make sure to clear the timeout if initialization failed
+        if (initTimeoutRef.current) {
+          clearTimeout(initTimeoutRef.current);
+          initTimeoutRef.current = null;
+        }
+        throw error; // Re-throw to be caught by the outer catch block
+      }
 
     } catch (error) {
       console.error('[Sensors] Initialization error:', error);
@@ -447,10 +469,13 @@ export function useSensors(options?: SensorOptions): SensorHookResult {
       return;
     }
 
+    // We'll initialize sensors, but we won't automatically start tracking
+    // This prevents double initialization when MappingScreen also calls initializeSensors
     const initialize = async () => {
       try {
         if (mounted) {
-          await startTracking();
+          // Just check if sensors are available but don't start tracking yet
+          await checkSensorAvailability();
         }
       } catch (error) {
         console.error('[Sensors] Initialization effect error:', error);
@@ -464,13 +489,25 @@ export function useSensors(options?: SensorOptions): SensorHookResult {
       if (isTracking) {
         stopTracking();
       }
+      
+      // Make sure to clear any lingering timeouts
+      if (initTimeoutRef.current) {
+        clearTimeout(initTimeoutRef.current);
+        initTimeoutRef.current = null;
+      }
     };
-  }, [enabled, isTracking, startTracking, stopTracking]);
+  }, [enabled, isTracking, stopTracking]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       cleanupSubscriptions();
+      
+      // Also clear any timeouts
+      if (initTimeoutRef.current) {
+        clearTimeout(initTimeoutRef.current);
+        initTimeoutRef.current = null;
+      }
     };
   }, [cleanupSubscriptions]);
 
